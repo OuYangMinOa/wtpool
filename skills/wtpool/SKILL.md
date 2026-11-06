@@ -44,10 +44,11 @@ the pool. The exception is Claude Code with the wtpool plugin installed, below.
 
 - After the branch is merged, run `wtpool release <wN>` (just `wtpool release` from inside that worktree). It switches
   the worktree back to the base branch and refreshes its dependencies. The branch itself is kept.
-- `release` refuses while there are uncommitted changes. Commit them; only add `--stash` (the changes go to
-  `git stash`) when they are definitely not needed.
-- `wtpool sweep` puts back every worktree whose branch has been merged; `wtpool sweep --stale` also puts back worktrees
-  that were taken long ago and have no new commits.
+- `release` refuses while there are uncommitted changes. Commit them; only add `--stash` when they are definitely not
+  needed (they are set aside under `refs/wtpool/stash/`, and `git stash apply <ref>` brings them back).
+- `wtpool sweep` puts back every worktree whose branch has been merged (squash and rebase merges included);
+  `wtpool sweep --stale` also puts back worktrees that were taken long ago and have no new commits.
+- If `take` failed while installing dependencies, run the same `wtpool take <branch>` again: it retries the install.
 
 ## Other commands
 

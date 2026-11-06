@@ -137,7 +137,8 @@ wtpool sweep                   # 分支已經合併的全部放回
 
 - `run`：要跑的指令，經過系統 shell（Windows 是 cmd.exe）。環境變數有 `WTPOOL_SLOT`（編號）和 `WTPOOL_PATH`。
 - `cwd`：在哪個子目錄跑，預設 repo 根目錄。
-- `watch`：這些檔案在新舊版本之間有變才重跑（通常是 lockfile）。
+- `watch`：這些檔案在新舊版本之間有變才重跑（通常是 lockfile）。`release` 時分支最後的 commit 和收起來的變更
+  也會一起比，分支上改過 lockfile、沒合併就放回，也會照基準分支重裝。
 - `ifMissing`：這個路徑不存在就重跑（通常是 `node_modules`）。
 
 新建的 worktree、或上一次準備失敗的，所有步驟都會跑。其餘情況只跑 `watch` 或 `ifMissing` 成立的步驟；
@@ -150,7 +151,7 @@ wtpool sweep                   # 分支已經合併的全部放回
 | 狀態 | 意思 | `take` 會拿嗎 |
 | --- | --- | --- |
 | 閒置 | 停在基準分支（detached），沒有變更 | 會 |
-| 可回收 | 分支已經合併進基準分支、沒有變更 | 會（分支留著） |
+| 可回收 | 分支已經合併進基準分支（一般合併、squash、rebase 都認得）、沒有變更 | 會（分支留著） |
 | 使用中 | 有人拿走、或有未提交的變更 | 不會 |
 | 可能沒在用 | 拿走超過 `staleAfterHours` 都沒有 commit | 不會，`sweep --stale` 才放回 |
 | 準備中 | 正在安裝套件 | 不會 |
@@ -167,7 +168,7 @@ wtpool sweep                   # 分支已經合併的全部放回
 | `init [數量]` | 沒有 `.wtpool.json` 就產生一份，再把 worktree 補到指定數量（預設 `size`） |
 | `status [--json]` | 列出每個 worktree 的狀態 |
 | `take <分支> [--slot wN] [--from <ref>]` | 挑一個閒著的開分支，只把路徑印到 stdout。分支已存在就切過去；只在 origin 有就接著 origin 的做 |
-| `release [wN\|分支\|路徑] [--stash]` | 放回：切回基準分支、裝好套件，分支留著。有未提交的變更會拒絕，`--stash` 先收進 `git stash` |
+| `release [wN\|分支\|路徑] [--stash]` | 放回：切回基準分支、裝好套件，分支留著。有未提交的變更會拒絕，`--stash` 先收到 `refs/wtpool/stash/` 底下（不進所有 worktree 共用的 `git stash`），`git stash apply <ref>` 拿得回來 |
 | `add [數量]` | 多開幾個 |
 | `remove <wN>` | 移除一個閒置的（整個目錄刪掉） |
 | `refresh` | 把閒置的更新到最新的基準分支並裝好套件 |
@@ -175,7 +176,7 @@ wtpool sweep                   # 分支已經合併的全部放回
 | `which` | 目前目錄在哪個 worktree |
 | `hook create\|remove` | 給 Claude Code 的 hook 用，從 stdin 讀 JSON，見下面 |
 
-共用參數：`--no-fetch` 不先 fetch、`--quiet` 不印過程。
+共用參數：`--no-fetch` 不先 fetch、`--quiet` 不印過程。`status` 只抓基準分支，其他指令整個 remote 都抓。
 
 結束碼：`0` 成功、`1` 錯誤、`2` 沒有閒著的 worktree。
 
@@ -207,10 +208,9 @@ plugin 在 `hooks/hooks.json` 掛了 `WorktreeCreate` 和 `WorktreeRemove` 兩�
   - 沒有 `.wtpool.json`：照 Claude Code 的做法開在 `.claude/worktrees/<名稱>`，分支 `worktree-<名稱>`，
     並照 `.worktreeinclude` 複製檔案（支援一般路徑和根目錄的萬用字元）。
 - **移除**（`wtpool hook remove`）：
-  - 池子的 worktree 放回池子而不是刪掉：未提交的變更收進 `git stash`，沒有 commit 的 `wt/*` 分支刪掉、
-    有 commit 的留著，套件在背景重裝。
-  - `.claude/worktrees/` 底下的照 Claude Code 的做法刪掉，未提交的變更一樣先收進 `git stash`，
-    分支已經合併才刪。
+  - 池子的 worktree 放回池子而不是刪掉：未提交的變更收到 `refs/wtpool/stash/` 底下，已合併（或沒有 commit）的
+    `wt/*` 分支刪掉、還有沒合併的 commit 就留著，套件在背景重裝。
+  - `.claude/worktrees/` 底下的照 Claude Code 的做法刪掉，未提交的變更一樣先收起來，分支已經合併才刪。
 
 為什麼不用 plugin 的 hook 模組（`hooks.modules`）：實測 Claude Code 2.1.318 內建的安全模組不讓使用者層級的
 hook 模組接手 `WorktreeCreate`，而且 `claude --worktree` 啟動時 worktree 會在 hook 模組載入前就建好，

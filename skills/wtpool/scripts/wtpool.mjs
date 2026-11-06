@@ -9,10 +9,11 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const SELF = fileURLToPath(import.meta.url)
 const CONFIG_FILE = '.wtpool.json'
 const META_FILE = 'wtpool.json'
@@ -103,6 +104,8 @@ Exit codes: 0 success, 1 error, 2 no idle worktree`,
     noteIdleFailed: 'idle (last preparation failed; it will rerun)',
     noteMerged: base => `branch merged into ${base}`,
     noteStale: hours => `taken ${hours} hours ago with no commits`,
+    noteTakeFailed: b => `in use (preparation failed; run wtpool take ${b} again to retry)`,
+    noteGone: 'in use (its branch was deleted on the remote; if it was merged, run wtpool release)',
     slotNotFound: key => `no worktree ${key}`,
     notInSlotPick: 'the current directory is not in a wtpool worktree; say which one (e.g. w2)',
     runStep: (name, run, cwd) => `  ${name}: ${run}${cwd ? ` (in ${cwd})` : ''}`,
@@ -123,11 +126,10 @@ Exit codes: 0 success, 1 error, 2 no idle worktree`,
     took: (name, desc, b) => `${name}: ${b} (${desc})`,
     slotWarming: name => `${name} is being prepared; release it a little later`,
     slotDirty: name =>
-      `${name} has uncommitted changes; commit or clean them up first (or add --stash to keep them in git stash)`,
+      `${name} has uncommitted changes; commit or clean them up first (or add --stash to set them aside under refs/wtpool/stash/)`,
     stashRelease: what => `wtpool: ${what} — uncommitted changes before release`,
     stashRemove: what => `wtpool: ${what} — uncommitted changes before removal`,
-    noteStashed: 'uncommitted changes were saved to git stash (see git stash list)',
-    noteStashedShort: 'uncommitted changes were saved to git stash',
+    noteStashed: ref => `uncommitted changes were saved to ${ref} (bring them back with: git stash apply ${ref})`,
     noteAhead: (b, n, base) => `branch ${b} has ${n} commit(s) not in ${base}; the branch is kept`,
     noteDeletedMerged: b => `deleted merged branch ${b}`,
     released: (name, base) => `${name} released (${base}, detached)`,
@@ -231,6 +233,8 @@ Exit codes: 0 success, 1 error, 2 no idle worktree`,
     noteIdleFailed: '閒置（上次準備失敗，下次會重跑）',
     noteMerged: base => `分支已合併進 ${base}`,
     noteStale: hours => `拿走 ${hours} 小時都沒有 commit`,
+    noteTakeFailed: b => `使用中（準備失敗，再跑一次 wtpool take ${b} 會重試）`,
+    noteGone: '使用中（遠端的分支已經刪掉了；確定合併了就跑 wtpool release）',
     slotNotFound: key => `找不到 worktree ${key}`,
     notInSlotPick: '目前目錄不在 wtpool 的 worktree 裡，請指定要哪一個（例如 w2）',
     runStep: (name, run, cwd) => `  ${name}：${run}${cwd ? `（在 ${cwd}）` : ''}`,
@@ -250,11 +254,11 @@ Exit codes: 0 success, 1 error, 2 no idle worktree`,
     reuse: (b, name) => `${b} 已經在 ${name}，沿用`,
     took: (name, desc, b) => `${name}：${desc} ${b}`,
     slotWarming: name => `${name} 正在準備中，等一下再放回`,
-    slotDirty: name => `${name} 有未提交的變更，先 commit 或清掉再放回（確定不要了可以加 --stash 收進 git stash）`,
+    slotDirty: name =>
+      `${name} 有未提交的變更，先 commit 或清掉再放回（確定不要了可以加 --stash，會收到 refs/wtpool/stash/ 底下）`,
     stashRelease: what => `wtpool: ${what} 放回前沒提交的變更`,
     stashRemove: what => `wtpool: ${what} 移除前沒提交的變更`,
-    noteStashed: '沒提交的變更收進了 git stash（git stash list 看得到）',
-    noteStashedShort: '沒提交的變更收進了 git stash',
+    noteStashed: ref => `沒提交的變更存到了 ${ref}（要拿回來：git stash apply ${ref}）`,
     noteAhead: (b, n, base) => `分支 ${b} 還有 ${n} 個 commit 沒進 ${base}，分支會留著`,
     noteDeletedMerged: b => `已刪除合併過的分支 ${b}`,
     released: (name, base) => `${name} 已放回（${base}，detached）`,
@@ -354,8 +358,16 @@ function isAlive(pid) {
   }
 }
 
-function git(args, { cwd, timeout, allowFail = false } = {}) {
-  const r = spawnSync('git', args, { cwd, timeout, encoding: 'utf8', windowsHide: true, maxBuffer: 256 << 20 })
+function git(args, { cwd, timeout, env, input, allowFail = false } = {}) {
+  const r = spawnSync('git', args, {
+    cwd,
+    timeout,
+    input,
+    env: env && { ...process.env, ...env },
+    encoding: 'utf8',
+    windowsHide: true,
+    maxBuffer: 256 << 20,
+  })
   const res = {
     ok: !r.error && r.status === 0,
     out: (r.stdout ?? '').replace(/\s+$/, ''),
@@ -369,6 +381,77 @@ const gitOk = (args, cwd) => git(args, { cwd, allowFail: true }).ok
 const revParse = (ref, cwd) => {
   const r = git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd, allowFail: true })
   return r.ok ? r.out : null
+}
+
+// commit-tree 要有作者；使用者沒設定時給個預設的，有設定就用他的
+const FALLBACK_IDENT = {
+  GIT_AUTHOR_NAME: 'wtpool',
+  GIT_AUTHOR_EMAIL: 'wtpool@localhost',
+  GIT_COMMITTER_NAME: 'wtpool',
+  GIT_COMMITTER_EMAIL: 'wtpool@localhost',
+}
+const identEnv = cwd => (gitOk(['var', 'GIT_COMMITTER_IDENT'], cwd) ? undefined : FALLBACK_IDENT)
+
+// rev 的內容是不是已經都進了 base。除了一般合併（rev 是 base 的祖先），也認得：
+//   - rebase 合併：每個 commit 在 base 裡都有內容一樣的（git cherry 全是 -）
+//   - squash 合併：整串壓成一個 commit 後，base 裡有內容一樣的（git-delete-squashed 的做法）
+function mergedInto(cwd, rev, base) {
+  if (gitOk(['merge-base', '--is-ancestor', rev, base], cwd)) return true
+  const cherry = git(['cherry', base, rev], { cwd, allowFail: true })
+  if (!cherry.ok) return false
+  const lines = cherry.out.split(/\r?\n/).filter(Boolean)
+  if (!lines.length) return false
+  if (lines.every(l => l.startsWith('-'))) return true
+  const fork = git(['merge-base', base, rev], { cwd, allowFail: true }).out
+  const tree = git(['rev-parse', `${rev}^{tree}`], { cwd, allowFail: true }).out
+  if (!fork || !tree || tree === git(['rev-parse', `${fork}^{tree}`], { cwd, allowFail: true }).out) return false
+  // 日期、作者固定，同一個分支每次算出來是同一個物件，不會一直多出新的
+  const env = { ...FALLBACK_IDENT, GIT_AUTHOR_DATE: '@0 +0000', GIT_COMMITTER_DATE: '@0 +0000' }
+  const squashed = git(['commit-tree', '--no-gpg-sign', tree, '-p', fork, '-m', 'wtpool: squash check'], {
+    cwd,
+    env,
+    allowFail: true,
+  })
+  if (!squashed.ok) return false
+  return git(['cherry', base, squashed.out], { cwd, allowFail: true }).out.startsWith('-')
+}
+
+// 把未提交的變更（含沒追蹤的檔案）存成 stash 格式的 commit，放在 refs/wtpool/stash/ 底下，再把 worktree 清乾淨。
+// 不用 git stash push：refs/stash 是所有 worktree 共用的，在主 checkout 跑 git stash pop 會把這些變更彈過去。
+// 拿回來：git stash apply <ref>。回傳 { ref, rev }；沒有東西可存時回傳 null
+function stashAside(cwd, label, message) {
+  const run = (args, opts) => git(args, { cwd, ...opts }).out
+  const env = identEnv(cwd)
+  const commit = (tree, parents, msg) =>
+    run(['commit-tree', '--no-gpg-sign', tree, ...parents.flatMap(p => ['-p', p]), '-m', msg], { env })
+  const head = run(['rev-parse', 'HEAD'])
+  const tracked = run(['stash', 'create', message]) // 追蹤中的檔案都沒變時是空字串
+  const files = run(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)
+  if (!tracked && !files.length) return null
+
+  let rev = tracked
+  if (files.length) {
+    // 跟 git stash -u 一樣：沒追蹤的檔案放進第三個 parent
+    const index = path.join(os.tmpdir(), `wtpool-${process.pid}-${Date.now()}.index`)
+    let untracked
+    try {
+      const ienv = { ...env, GIT_INDEX_FILE: index }
+      run(['read-tree', '--empty'], { env: ienv })
+      run(['update-index', '-z', '--add', '--remove', '--stdin'], { env: ienv, input: files.join('\0') })
+      untracked = commit(run(['write-tree'], { env: ienv }), [], `untracked files: ${message}`)
+    } finally {
+      fs.rmSync(index, { force: true })
+    }
+    const tree = run(['rev-parse', `${tracked || head}^{tree}`])
+    const indexCommit = tracked ? run(['rev-parse', `${tracked}^2`]) : commit(tree, [head], `index: ${message}`)
+    rev = commit(tree, [head, indexCommit, untracked], message)
+  }
+  const safe = String(label).replace(/[^A-Za-z0-9._-]+/g, '-')
+  const ref = `refs/wtpool/stash/${safe}-${now().replace(/[-:.]/g, '')}`
+  run(['update-ref', ref, rev])
+  run(['reset', '--hard', '--quiet'])
+  if (files.length) run(['clean', '--force', '--quiet', '-d'])
+  return { ref, rev }
 }
 
 // ---------- 設定與 repo ----------
@@ -491,9 +574,11 @@ function requireBase(ctx) {
   return ctx.base
 }
 
-function fetchBase(ctx, { timeout = 120_000 } = {}) {
+// onlyBase：只抓基準分支（status 用，快很多）；其他指令整個 remote 都抓，take 才找得到 origin 上的分支
+function fetchBase(ctx, { timeout = 120_000, onlyBase = false } = {}) {
   if (!ctx.remote) return
-  const r = git(['fetch', '--quiet', '--prune', ctx.remote], { cwd: ctx.main, timeout, allowFail: true })
+  const args = onlyBase ? [ctx.remote, ctx.baseBranch] : ['--prune', ctx.remote]
+  const r = git(['fetch', '--quiet', ...args], { cwd: ctx.main, timeout, allowFail: true })
   if (r.ok) return
   log(M.fetchFailed(ctx.remote, r.timedOut ? M.timedOut(timeout / 1000) : r.err, ctx.base))
 }
@@ -602,19 +687,28 @@ function inspect(ctx, slot) {
     return set('idle', slot.meta.warm?.ok === false ? M.noteIdleFailed : M.states.idle)
   }
 
-  const merged = Boolean(ctx.base) && gitOk(['merge-base', '--is-ancestor', 'HEAD', ctx.base], slot.path)
+  const merged = () => Boolean(ctx.base) && mergedInto(slot.path, 'HEAD', ctx.base)
+  // 遠端分支被刪了（[gone]）只當提示：PR 沒合併就關掉也會這樣，不能憑這個就讓別人拿走
+  const busy = () => {
+    const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${slot.branch}`], {
+      cwd: slot.path,
+      allowFail: true,
+    }).out
+    return set('busy', track === '[gone]' ? M.noteGone : M.states.busy)
+  }
   if (lease?.kind === 'take' && lease.branch === slot.branch) {
-    if (merged && slot.headRev !== lease.startRev) return set('done', M.noteMerged(ctx.base))
+    if (slot.headRev !== lease.startRev && merged()) return set('done', M.noteMerged(ctx.base))
     const hours = (Date.now() - Date.parse(lease.since)) / 36e5
     if (slot.headRev === lease.startRev && hours >= ctx.cfg.staleAfterHours) {
       return set('stale', M.noteStale(Math.floor(hours)))
     }
-    return set('busy', M.states.busy)
+    if (slot.meta.warm?.ok === false) return set('busy', M.noteTakeFailed(slot.branch))
+    return busy()
   }
   // 沒有 wtpool 的租約（舊版腳本拿的、或手動切的分支）：推過而且全部合併才算做完
   const upstream = git(['config', '--get', `branch.${slot.branch}.merge`], { cwd: ctx.main, allowFail: true }).out
-  if (merged && upstream && upstream !== `refs/heads/${ctx.baseBranch}`) return set('done', M.noteMerged(ctx.base))
-  return set('busy', M.states.busy)
+  if (upstream && upstream !== `refs/heads/${ctx.baseBranch}` && merged()) return set('done', M.noteMerged(ctx.base))
+  return busy()
 }
 
 function pickSlot(slots, key) {
@@ -646,14 +740,21 @@ function warmSteps(ctx, slot, targetRev) {
   if (!steps.length) return []
   const warm = slot.meta?.warm
   if (warm?.ok === false) return steps // 新建的、或上次失敗：全部重跑
-  const since = warm?.rev || slot.headRev
+  // 現在的套件可能是照哪個 commit 裝的：wtpool 上次裝的時候（warm.rev）、放回前分支的 HEAD 和收起來的變更
+  // （warm.also，拿去用的人可能在分支上自己改了 lockfile 又裝過）、現在的 HEAD。跟目標比，有一個不同就重跑
+  const sinces = new Set([warm?.rev, ...(warm?.also ?? []), slot.headRev].filter(r => r && r !== targetRev))
   return steps.filter(step => {
     if (step.ifMissing && !fs.existsSync(path.join(slot.path, step.ifMissing))) return true
-    if (step.watch.length && since && targetRev && since !== targetRev) {
-      return !gitOk(['diff', '--quiet', since, targetRev, '--', ...step.watch], slot.path)
-    }
-    return false
+    if (!step.watch.length || !targetRev) return false
+    return [...sinces].some(since => !gitOk(['diff', '--quiet', since, targetRev, '--', ...step.watch], slot.path))
   })
+}
+
+// 已經拿著的 worktree 再 take 一次：上次準備失敗、或 ifMissing 的東西不見了，就補跑。
+// 其他情況不動它，可能有人正在裡面用
+function repairSteps(ctx, slot) {
+  if (slot.meta?.warm?.ok === false) return ctx.cfg.setup
+  return ctx.cfg.setup.filter(s => s.ifMissing && !fs.existsSync(path.join(slot.path, s.ifMissing)))
 }
 
 function runWarm(ctx, slot, steps) {
@@ -762,7 +863,8 @@ function take(ctx, branch, opts = {}) {
   const picked = withLock(ctx, () => {
     const slots = findSlots(ctx).map(s => inspect(ctx, s))
     const mine = slots.find(s => s.branch === branch)
-    if (mine) return { slot: mine, again: true }
+    if (mine?.state === 'missing') throw new WtError(`${mine.name} ${mine.note}`)
+    if (mine) return { slot: mine, again: true, steps: repairSteps(ctx, mine) }
     const elsewhere = listWorktrees(ctx.main).find(w => w.branch === branch)
     if (elsewhere) throw new WtError(M.branchElsewhere(branch, elsewhere.path))
 
@@ -798,6 +900,11 @@ function take(ctx, branch, opts = {}) {
   const { slot } = picked
   if (picked.again) {
     log(M.reuse(branch, slot.name))
+    // 上次 take 裝套件失敗的話，這次補裝；不然拿到的是沒裝好的 worktree，結束碼卻是 0
+    if (picked.steps.length) {
+      copyFiles(ctx, slot)
+      runWarm(ctx, slot, picked.steps)
+    }
     return picked
   }
   copyFiles(ctx, slot)
@@ -819,23 +926,30 @@ function release(ctx, key, opts = {}) {
     if (slot.state === 'missing') throw new WtError(`${slot.name} ${slot.note}`)
     if (slot.state === 'warming') throw new WtError(M.slotWarming(slot.name))
     const notes = []
+    // 切走以前的 HEAD 和收起來的變更都記下來，之後判斷要不要重裝套件時一起比（見 warmSteps）
+    const also = [slot.headRev]
     if (slot.dirty) {
       if (!opts.stash) throw new WtError(M.slotDirty(slot.name))
-      git(['stash', 'push', '--include-untracked', '--message', M.stashRelease(slot.branch ?? slot.name)], {
-        cwd: slot.path,
-      })
-      notes.push(M.noteStashed)
+      const saved = stashAside(slot.path, slot.name, M.stashRelease(slot.branch ?? slot.name))
+      if (saved) {
+        also.push(saved.rev)
+        notes.push(M.noteStashed(saved.ref))
+      }
     }
     const branch = slot.branch
-    if (branch) {
+    const merged = Boolean(branch) && mergedInto(slot.path, 'HEAD', ctx.base)
+    if (branch && !merged) {
       const ahead = Number(git(['rev-list', '--count', `${ctx.base}..HEAD`], { cwd: slot.path, allowFail: true }).out || 0)
       if (ahead > 0) notes.push(M.noteAhead(branch, ahead, ctx.base))
     }
     git(['switch', '--quiet', '--detach', ctx.base], { cwd: slot.path })
     git(['worktree', 'unlock', slot.path], { cwd: ctx.main, allowFail: true })
     const del = opts.deleteBranch === true || (opts.deleteBranch === 'hook' && ctx.hookRe.test(branch ?? ''))
-    if (branch && del && gitOk(['branch', '-d', branch], slot.path)) notes.push(M.noteDeletedMerged(branch))
+    if (merged && del && gitOk(['branch', '-D', branch], slot.path)) {
+      notes.push(M.noteDeletedMerged(branch))
+    }
     updateMeta(slot, m => {
+      m.warm = { ...m.warm, also: [...new Set([...(m.warm?.also ?? []), ...also])] }
       m.lease = opts.background ? null : { kind: 'warm', pid: process.pid, since: now() }
     })
     return { slot, notes, branch }
@@ -857,10 +971,10 @@ function release(ctx, key, opts = {}) {
   return r
 }
 
-function add(ctx, count = 1) {
+function add(ctx, count = 1, opts = {}) {
   requireConfig(ctx)
   requireBase(ctx)
-  fetchBase(ctx)
+  if (!opts.noFetch) fetchBase(ctx)
   if (!revParse(ctx.base, ctx.main)) throw new WtError(M.refNotFound(ctx.base))
 
   const created = withLock(ctx, () => {
@@ -940,7 +1054,7 @@ function refresh(ctx, opts = {}) {
 function sweep(ctx, opts = {}) {
   requireConfig(ctx)
   requireBase(ctx)
-  fetchBase(ctx)
+  if (!opts.noFetch) fetchBase(ctx)
   const slots = findSlots(ctx).map(s => inspect(ctx, s))
   const wanted = slots.filter(s => s.state === 'done' || (opts.stale && s.state === 'stale'))
   if (!wanted.length) log(M.nothingToSweep)
@@ -976,6 +1090,29 @@ function remove(ctx, key) {
 
 // ---------- 範本 ----------
 
+const readText = file => {
+  try {
+    return fs.readFileSync(file, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+// 子目錄的設定沒有就看 repo 根目錄的。回傳 null 表示 Yarn 1；否則 { pnp }
+function yarnBerry(main, dir) {
+  const rc = readText(path.join(main, dir, '.yarnrc.yml')) ?? readText(path.join(main, '.yarnrc.yml'))
+  let pm = ''
+  for (const d of [dir, '.']) {
+    try {
+      pm ||= JSON.parse(readText(path.join(main, d, 'package.json')) ?? '{}').packageManager ?? ''
+    } catch {}
+  }
+  const major = Number(/^yarn@(\d+)/.exec(pm)?.[1] ?? 0)
+  if (major === 1 || (rc === null && major < 2)) return null
+  const linker = /^nodeLinker:\s*["']?([\w-]+)/m.exec(rc ?? '')?.[1] ?? 'pnp'
+  return { pnp: linker === 'pnp' }
+}
+
 function detectSetup(main) {
   const dirs = ['.']
   try {
@@ -988,9 +1125,15 @@ function detectSetup(main) {
     const has = f => fs.existsSync(path.join(main, d, f))
     const rel = f => (d === '.' ? f : `${d}/${f}`)
     const cwd = d === '.' ? {} : { cwd: d }
-    const node = (lock, run) => steps.push({ run, ...cwd, watch: [rel(lock)], ifMissing: rel('node_modules') })
+    const node = (lock, run, made = 'node_modules') => steps.push({ run, ...cwd, watch: [rel(lock)], ifMissing: rel(made) })
     if (has('pnpm-lock.yaml')) node('pnpm-lock.yaml', 'pnpm install --frozen-lockfile')
-    else if (has('yarn.lock')) node('yarn.lock', 'yarn install --frozen-lockfile')
+    else if (has('yarn.lock')) {
+      // Yarn 2 以上（有 .yarnrc.yml 或 packageManager 寫 yarn@2+）：預設是 PnP，沒有 node_modules，
+      // 要看 .pnp.cjs 在不在；不然 ifMissing 永遠成立，每次 take、release 都重裝
+      const berry = yarnBerry(main, d)
+      if (berry) node('yarn.lock', 'yarn install --immutable', berry.pnp ? '.pnp.cjs' : 'node_modules')
+      else node('yarn.lock', 'yarn install --frozen-lockfile')
+    }
     else if (has('bun.lock')) node('bun.lock', 'bun install --frozen-lockfile')
     else if (has('package-lock.json')) node('package-lock.json', 'npm ci --no-audit --no-fund')
     if (has('uv.lock')) steps.push({ run: 'uv sync --frozen', ...cwd, watch: [rel('uv.lock')], ifMissing: rel('.venv') })
@@ -1115,10 +1258,8 @@ function nativeRemove(ctx, p) {
   if (!info || !isInside(p, nativeDir(ctx))) throw new WtError(M.nativeNotOurs(p))
   const notes = []
   if (git(['status', '--porcelain'], { cwd: p }).out) {
-    git(['stash', 'push', '--include-untracked', '--message', M.stashRemove(info.branch ?? path.basename(p))], {
-      cwd: p,
-    })
-    notes.push(M.noteStashedShort)
+    const saved = stashAside(p, path.basename(p), M.stashRemove(info.branch ?? path.basename(p)))
+    if (saved) notes.push(M.noteStashed(saved.ref))
   }
   git(['worktree', 'unlock', p], { cwd: ctx.main, allowFail: true })
   const rm = git(['worktree', 'remove', '--force', p], { cwd: ctx.main, allowFail: true })
@@ -1132,7 +1273,7 @@ function nativeRemove(ctx, p) {
     }
   }
   if (info.branch) {
-    const merged = gitOk(['merge-base', '--is-ancestor', info.branch, ctx.base ?? 'HEAD'], ctx.main)
+    const merged = mergedInto(ctx.main, info.branch, ctx.base ?? 'HEAD')
     if (merged && gitOk(['branch', '-D', info.branch], ctx.main)) notes.push(M.noteDeletedBranch(info.branch))
     else notes.push(M.noteKeptBranch(info.branch))
   }
@@ -1225,7 +1366,7 @@ function main(argv) {
   let ctx = getContext(process.cwd())
   switch (cmd) {
     case 'status': {
-      if (!noFetch && ctx.base) fetchBase(ctx, { timeout: 30_000 })
+      if (!noFetch && ctx.base) fetchBase(ctx, { timeout: 10_000, onlyBase: true })
       const slots = findSlots(ctx).map(s => inspect(ctx, s))
       if (flags.json) {
         const data = { repo: ctx.main, dir: ctx.poolDir, base: ctx.base, configured: ctx.configured }
@@ -1240,7 +1381,7 @@ function main(argv) {
       }
       const want = toCount(a1, ctx.cfg.size)
       const have = findSlots(ctx).length
-      if (want > have) add(ctx, want - have)
+      if (want > have) add(ctx, want - have, { noFetch })
       printStatus(
         ctx,
         findSlots(ctx).map(s => inspect(ctx, s)),
@@ -1248,7 +1389,7 @@ function main(argv) {
       return EXIT.OK
     }
     case 'add': {
-      add(ctx, Math.max(1, toCount(a1, 1)))
+      add(ctx, Math.max(1, toCount(a1, 1)), { noFetch })
       printStatus(
         ctx,
         findSlots(ctx).map(s => inspect(ctx, s)),
@@ -1273,7 +1414,7 @@ function main(argv) {
     case 'refresh':
       return refresh(ctx, { noFetch })
     case 'sweep':
-      return sweep(ctx, { stale: Boolean(flags.stale) })
+      return sweep(ctx, { stale: Boolean(flags.stale), noFetch })
     case 'remove': {
       if (!a1) throw new WtError(M.usageRemove)
       remove(ctx, a1)

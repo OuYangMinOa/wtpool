@@ -2,15 +2,16 @@
 
 [English](README.md) | **繁體中文**
 
-同時開好幾個分支（或讓好幾個 Claude Code session 平行工作）時，每個 worktree 都要重裝 node_modules、
+同時開好幾個分支（或讓好幾個 AI agent 平行工作）時，每個 worktree 都要重裝 node_modules、
 重新編譯，往往比改程式還久。wtpool 讓 repo 保留一組固定的 worktree：平常停在基準分支，
 套件和編譯產物都留著；接需求時挑一個閒著的開分支，做完放回去，下一個需求拿到就能直接用。
 
-- **CLI**：`cli/wtpool.mjs`，Node 18 以上、零依賴，Windows / macOS / Linux 都能跑。
-- **Claude Code plugin**：
-  - hook 接手 Claude Code 內建的 worktree（`claude --worktree`、`EnterWorktree`、subagent 的
-    `isolation: worktree`、背景 session），改從池子拿。
-  - skill 讓 Claude 知道開工前要 `take`、做完要 `release`、池子都在忙要先問人。
+- **CLI**：`skills/wtpool/scripts/wtpool.mjs`，Node 18 以上、零依賴，Windows / macOS / Linux 都能跑。
+- **Agent skill**：`skills/wtpool` 是 [Agent Skills](https://agentskills.io) 格式，CLI 就放在裡面。它讓 agent
+  知道開工前要 `take`、做完要 `release`、池子都在忙要先問人。Codex、Cursor、Gemini CLI、GitHub Copilot、
+  OpenCode、Claude Code 這些會讀 skill 的 agent 都能用。
+- **Claude Code plugin**：上面的 skill，加上接手 Claude Code 內建 worktree 的 hook（`claude --worktree`、
+  `EnterWorktree`、subagent 的 `isolation: worktree`、背景 session），改從池子拿。
 
 ## 安裝
 
@@ -45,12 +46,38 @@ Claude Code 建 worktree 的做法；沒有 `.wtpool.json` 的 repo 雖然會照
 
 開發 plugin 本身時，用 `claude --plugin-dir <wtpool 的資料夾>` 直接從資料夾載入。
 
+### 其他 agent（Codex、Cursor、Gemini CLI、Copilot…）
+
+```
+npx skills add OuYangMinOa/wtpool
+```
+
+[skills](https://github.com/vercel-labs/skills) 會找出你裝了哪些 agent，把 skill 裝給它們，預設裝在專案裡
+（`.agents/skills/`，Claude Code 是 `.claude/skills/`）；加 `-g` 就所有專案都能用。CLI 在 skill 裡面，
+只要有 Node 18 以上就好。也可以自己把 `skills/wtpool` 資料夾複製到 agent 的 skills 資料夾。
+Claude Code 請裝 plugin，skill 一樣，還多了 hook。
+
+其他 agent 沒有 hook，它們自己的 worktree 功能還是會在池子外開新的；skill 會讓它們改用 `wtpool take` / `release`。
+
+### 不支援 skill 的 agent：`AGENTS.md`
+
+agent 不讀 skill，或想確保在 repo 裡工作的每個 agent 都知道有池子，就裝好 CLI（見下面），
+在 repo 的 `AGENTS.md`（或 `CLAUDE.md`）加一段：
+
+```markdown
+## Worktrees
+
+This repo uses wtpool (see `.wtpool.json`). Before working on a new branch, run `wtpool take <branch>` and do all
+the work in the path it prints; don't edit the main checkout or run `git worktree add`. Once the branch is merged,
+run `wtpool release`. If `take` exits with code 2, every worktree is busy: ask before running `wtpool add`.
+```
+
 ### 只用 CLI
 
 ```
 npm install -g github:OuYangMinOa/wtpool   # 之後就有 wtpool 指令
 # 或 clone 下來直接跑
-node wtpool/cli/wtpool.mjs status
+node wtpool/skills/wtpool/scripts/wtpool.mjs status
 ```
 
 ## 開始使用
@@ -198,3 +225,5 @@ hook 模組接手 `WorktreeCreate`，而且 `claude --worktree` 啟動時 worktr
 npm test        # node --test，用暫存目錄建 repo 跟本機的 bare origin 實際跑
 claude plugin validate .
 ```
+
+GitHub Actions 會在 Windows、macOS、Linux 上用 Node 18 和 22 跑測試。

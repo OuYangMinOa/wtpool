@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const SELF = fileURLToPath(import.meta.url)
 const CONFIG_FILE = '.wtpool.json'
 const META_FILE = 'wtpool.json'

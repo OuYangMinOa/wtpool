@@ -7,7 +7,7 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-const CLI = fileURLToPath(new URL('../cli/wtpool.mjs', import.meta.url))
+const CLI = fileURLToPath(new URL('../skills/wtpool/scripts/wtpool.mjs', import.meta.url))
 // 既有的斷言用中文訊息，預設固定用 zh-TW 跑；英文另外測
 const BASE_ENV = { WTPOOL_LANG: 'zh-TW' }
 

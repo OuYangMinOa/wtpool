@@ -1,15 +1,15 @@
 {
   "name": "wtpool",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A pool of warm git worktrees: branch off in a worktree that already has node_modules and build output, no reinstall or rebuild",
   "license": "MIT",
   "repository": "github:OuYangMinOa/wtpool",
   "type": "module",
   "bin": {
-    "wtpool": "cli/wtpool.mjs"
+    "wtpool": "skills/wtpool/scripts/wtpool.mjs"
   },
   "files": [
-    "cli/"
+    "skills/wtpool/scripts/"
   ],
   "engines": {
     "node": ">=18"

@@ -2,17 +2,18 @@
 
 **English** | [繁體中文](README.zh-TW.md)
 
-When you work on several branches at once, or run several Claude Code sessions in parallel, every new worktree
+When you work on several branches at once, or run several coding agents in parallel, every new worktree
 has to reinstall `node_modules` and rebuild from scratch, which often takes longer than the change itself.
 wtpool keeps a fixed set of worktrees for a repo. They sit on the base branch with dependencies and build output
 in place; when a task starts you take an idle one and branch off, and when it's done you put it back, so the next
 task starts warm.
 
-- **CLI**: `cli/wtpool.mjs`, Node 18+, zero dependencies, runs on Windows, macOS and Linux.
-- **Claude Code plugin**:
-  - Hooks take over Claude Code's built-in worktrees (`claude --worktree`, `EnterWorktree`, subagents with
-    `isolation: worktree`, background sessions) and serve them from the pool.
-  - A skill tells Claude to `take` before starting work, `release` when done, and ask you before growing the pool.
+- **CLI**: `skills/wtpool/scripts/wtpool.mjs`, Node 18+, zero dependencies, runs on Windows, macOS and Linux.
+- **Agent skill**: `skills/wtpool` follows the [Agent Skills](https://agentskills.io) format and carries the CLI
+  with it. It tells the agent to `take` before starting work, `release` when done, and ask you before growing the
+  pool. Works with Codex, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Claude Code and other agents that read skills.
+- **Claude Code plugin**: the skill plus hooks that take over Claude Code's built-in worktrees (`claude --worktree`,
+  `EnterWorktree`, subagents with `isolation: worktree`, background sessions) and serve them from the pool.
 
 ## Install
 
@@ -48,12 +49,40 @@ To have everyone who clones a repo get the plugin automatically, add this to the
 
 When developing the plugin itself, load it straight from the folder with `claude --plugin-dir <path to wtpool>`.
 
+### Other agents (Codex, Cursor, Gemini CLI, Copilot, …)
+
+```
+npx skills add OuYangMinOa/wtpool
+```
+
+[skills](https://github.com/vercel-labs/skills) finds the coding agents you have and installs the skill for them, in
+the project by default (`.agents/skills/`, or `.claude/skills/` for Claude Code); add `-g` to install it for all
+your projects. The CLI comes inside the skill, so Node 18+ is all you need. You can also copy the `skills/wtpool`
+folder into your agent's skills folder by hand. In Claude Code, install the plugin instead: it has the same skill
+plus the hooks.
+
+Other agents get no hooks; their own worktree features keep creating fresh worktrees outside the pool. The skill
+has them run `wtpool take` / `release` instead.
+
+### Agents without skills: `AGENTS.md`
+
+For agents that don't read skills, or to make sure every agent working in a repo knows about the pool, install the
+CLI (below) and add a note to the repo's `AGENTS.md` (or `CLAUDE.md`):
+
+```markdown
+## Worktrees
+
+This repo uses wtpool (see `.wtpool.json`). Before working on a new branch, run `wtpool take <branch>` and do all
+the work in the path it prints; don't edit the main checkout or run `git worktree add`. Once the branch is merged,
+run `wtpool release`. If `take` exits with code 2, every worktree is busy: ask before running `wtpool add`.
+```
+
 ### CLI only
 
 ```
 npm install -g github:OuYangMinOa/wtpool   # gives you the wtpool command
 # or clone the repo and run it directly
-node wtpool/cli/wtpool.mjs status
+node wtpool/skills/wtpool/scripts/wtpool.mjs status
 ```
 
 ## Getting started
@@ -204,3 +233,5 @@ Note: Claude Code doesn't call `WorktreeRemove` when a subagent or workflow fini
 npm test        # node --test; builds throwaway repos with a local bare origin and runs the real CLI
 claude plugin validate .
 ```
+
+GitHub Actions runs the tests on Windows, macOS and Linux with Node 18 and 22.

@@ -1,36 +1,43 @@
-# wtpool：預熱好的 git worktree 池
+# wtpool: a pool of warm git worktrees
 
-同時開好幾個分支（或讓好幾個 Claude Code session 平行工作）時，每個 worktree 都要重裝 node_modules、
-重新編譯，往往比改程式還久。wtpool 讓 repo 保留一組固定的 worktree：平常停在基準分支，
-套件和編譯產物都留著；接需求時挑一個閒著的開分支，做完放回去，下一個需求拿到就能直接用。
+**English** | [繁體中文](README.zh-TW.md)
 
-- **CLI**：`cli/wtpool.mjs`，Node 18 以上、零依賴，Windows / macOS / Linux 都能跑。
-- **Claude Code plugin**：
-  - hook 接手 Claude Code 內建的 worktree（`claude --worktree`、`EnterWorktree`、subagent 的
-    `isolation: worktree`、背景 session），改從池子拿。
-  - skill 讓 Claude 知道開工前要 `take`、做完要 `release`、池子都在忙要先問人。
+When you work on several branches at once, or run several Claude Code sessions in parallel, every new worktree
+has to reinstall `node_modules` and rebuild from scratch, which often takes longer than the change itself.
+wtpool keeps a fixed set of worktrees for a repo. They sit on the base branch with dependencies and build output
+in place; when a task starts you take an idle one and branch off, and when it's done you put it back, so the next
+task starts warm.
 
-## 安裝
+- **CLI**: `cli/wtpool.mjs`, Node 18+, zero dependencies, runs on Windows, macOS and Linux.
+- **Claude Code plugin**:
+  - Hooks take over Claude Code's built-in worktrees (`claude --worktree`, `EnterWorktree`, subagents with
+    `isolation: worktree`, background sessions) and serve them from the pool.
+  - A skill tells Claude to `take` before starting work, `release` when done, and ask you before growing the pool.
+
+> The CLI's own messages are currently in Traditional Chinese. Exit codes and `status --json` are language-neutral.
+
+## Install
 
 ### Claude Code plugin
 
-在 Claude Code 裡輸入：
+In Claude Code, type:
 
 ```
 /plugin install wtpool --marketplace OuYangMinOa/wtpool
 ```
 
-問要不要加入 marketplace 時按 `y`，再選安裝範圍（見下面的建議）。也可以在終端機裡跑：
+Answer `y` when asked to add the marketplace, then pick a scope (see the recommendation below). Or from a terminal:
 
 ```
 claude plugin install wtpool --marketplace OuYangMinOa/wtpool --scope local
 ```
 
-**建議裝在 project 或 local scope**，只在有 `.wtpool.json` 的 repo 啟用。plugin 的 hook 一啟用就整個取代
-Claude Code 建 worktree 的做法；沒有 `.wtpool.json` 的 repo 雖然會照 Claude Code 的做法開
-（`.claude/worktrees/<名稱>`、分支 `worktree-<名稱>`），但少了 Claude Code 自己的定期清理，subagent 用過的 worktree 要自己清。
+**Install it at project or local scope**, only in repos that have a `.wtpool.json`. Once enabled, the plugin's
+hooks replace Claude Code's own worktree creation entirely. In a repo without `.wtpool.json` they still create
+worktrees the way Claude Code does (`.claude/worktrees/<name>` on branch `worktree-<name>`), but Claude Code's
+periodic cleanup no longer applies, so worktrees left behind by subagents have to be cleaned up by hand.
 
-想讓 clone 這個 repo 的每個人都自動裝上，在 repo 的 `.claude/settings.json` 加：
+To have everyone who clones a repo get the plugin automatically, add this to the repo's `.claude/settings.json`:
 
 ```json
 {
@@ -41,42 +48,42 @@ Claude Code 建 worktree 的做法；沒有 `.wtpool.json` 的 repo 雖然會照
 }
 ```
 
-開發 plugin 本身時，用 `claude --plugin-dir <wtpool 的資料夾>` 直接從資料夾載入。
+When developing the plugin itself, load it straight from the folder with `claude --plugin-dir <path to wtpool>`.
 
-### 只用 CLI
+### CLI only
 
 ```
-npm install -g github:OuYangMinOa/wtpool   # 之後就有 wtpool 指令
-# 或 clone 下來直接跑
+npm install -g github:OuYangMinOa/wtpool   # gives you the wtpool command
+# or clone the repo and run it directly
 node wtpool/cli/wtpool.mjs status
 ```
 
-## 開始使用
+## Getting started
 
-在 repo 裡：
-
-```
-wtpool init        # 產生 .wtpool.json（猜好基準分支和安裝指令），並建立 worktree
-```
-
-確認 `.wtpool.json` 的 `base` 和 `setup` 對不對，再 commit 進 repo，之後每個 clone 這個 repo 的人都能用。
+Inside a repo:
 
 ```
-wtpool take feature/login      # 挑一個閒著的開分支，stdout 印出路徑
-cd "$(wtpool take feature/login)"   # 或直接切過去
-wtpool status                  # 看每個 worktree 在做什麼
-wtpool release w2              # 做完放回（在那個 worktree 裡可以省略 w2）
-wtpool sweep                   # 分支已經合併的全部放回
+wtpool init        # writes .wtpool.json (guessing the base branch and install commands) and creates the worktrees
 ```
 
-## 設定：`.wtpool.json`
+Check that `base` and `setup` in `.wtpool.json` are right, then commit it so everyone who clones the repo can use it.
 
-放在 repo 根目錄，例如：
+```
+wtpool take feature/login           # take an idle worktree, create the branch, print its path on stdout
+cd "$(wtpool take feature/login)"   # or jump straight into it
+wtpool status                       # what every worktree is doing
+wtpool release w2                   # put it back when done (w2 can be omitted from inside that worktree)
+wtpool sweep                        # put back every worktree whose branch has been merged
+```
+
+## Configuration: `.wtpool.json`
+
+Lives at the repo root, for example:
 
 ```json
 {
   "base": "origin/dev",
-  "dir": "../ouyang_web-worktrees",
+  "dir": "../myapp-worktrees",
   "name": "worktree_w{n}",
   "size": 3,
   "copy": [".env"],
@@ -91,88 +98,93 @@ wtpool sweep                   # 分支已經合併的全部放回
 }
 ```
 
-| 欄位 | 預設 | 說明 |
+| Field | Default | Meaning |
 | --- | --- | --- |
-| `base` | origin 的預設分支 | 新分支從這裡開，放回時也切回這裡。開工和放回前都會先 `git fetch` |
-| `dir` | `../{repo}-worktrees` | worktree 放的目錄，相對於 repo 根目錄；`{repo}` 是 repo 資料夾名稱 |
-| `name` | `w{n}` | worktree 的資料夾名稱，`{n}` 是編號。改成既有的命名就能直接接手手動建的 worktree |
-| `size` | `2` | `wtpool init` 預設建立幾個 |
-| `setup` | `[]` | 準備步驟，見下面 |
-| `copy` | `[]` | 從主 checkout 複製到 worktree 的檔案。只複製被 gitignore 的（例如 `.env`），不然 worktree 會變髒 |
-| `hookBranch` | `wt/{name}` | Claude Code 內建 worktree 從池子拿時用的分支名稱，`{name}` 是 Claude Code 給的名字 |
-| `staleAfterHours` | `24` | 拿走超過這麼久都沒有 commit，`status` 標成「可能沒在用」，`sweep --stale` 會放回 |
+| `base` | origin's default branch | New branches start here and released worktrees go back here. `take` and `release` run `git fetch` first |
+| `dir` | `../{repo}-worktrees` | Where the worktrees live, relative to the repo root; `{repo}` is the repo's folder name |
+| `name` | `w{n}` | Folder name of each worktree, `{n}` being its number. Match an existing naming scheme to adopt worktrees you created by hand |
+| `size` | `2` | How many worktrees `wtpool init` creates |
+| `setup` | `[]` | Preparation steps, see below |
+| `copy` | `[]` | Files copied from the main checkout into each worktree. Only gitignored files (such as `.env`) are copied, so worktrees stay clean |
+| `hookBranch` | `wt/{name}` | Branch name used when Claude Code's built-in worktrees are served from the pool; `{name}` is the name Claude Code passes |
+| `staleAfterHours` | `24` | A taken worktree with no commits for this long shows as "maybe unused" in `status`, and `sweep --stale` puts it back |
 
-### setup 步驟
+### Setup steps
 
-每一步是 `{ "run", "cwd", "watch", "ifMissing" }`（也可以只寫指令字串）：
+Each step is `{ "run", "cwd", "watch", "ifMissing" }`, or just a command string:
 
-- `run`：要跑的指令，經過系統 shell（Windows 是 cmd.exe）。環境變數有 `WTPOOL_SLOT`（編號）和 `WTPOOL_PATH`。
-- `cwd`：在哪個子目錄跑，預設 repo 根目錄。
-- `watch`：這些檔案在新舊版本之間有變才重跑（通常是 lockfile）。
-- `ifMissing`：這個路徑不存在就重跑（通常是 `node_modules`）。
+- `run`: the command, run through the system shell (cmd.exe on Windows). `WTPOOL_SLOT` (the number) and
+  `WTPOOL_PATH` are set in its environment.
+- `cwd`: the subdirectory to run it in; defaults to the repo root.
+- `watch`: rerun only when these files differ between the old and new commit (usually lockfiles).
+- `ifMissing`: rerun when this path doesn't exist (usually `node_modules`).
 
-新建的 worktree、或上一次準備失敗的，所有步驟都會跑。其餘情況只跑 `watch` 或 `ifMissing` 成立的步驟；
-兩個都沒寫的步驟只在新建時跑一次。
+New worktrees, and worktrees whose last preparation failed, run every step. Otherwise only the steps whose
+`watch` or `ifMissing` condition holds are run; a step with neither runs once, when the worktree is created.
 
-## 狀態
+## States
 
-| 狀態 | 意思 | `take` 會拿嗎 |
-| --- | --- | --- |
-| 閒置 | 停在基準分支（detached），沒有變更 | 會 |
-| 可回收 | 分支已經合併進基準分支、沒有變更 | 會（分支留著） |
-| 使用中 | 有人拿走、或有未提交的變更 | 不會 |
-| 可能沒在用 | 拿走超過 `staleAfterHours` 都沒有 commit | 不會，`sweep --stale` 才放回 |
-| 準備中 | 正在安裝套件 | 不會 |
-| 不見了 | 目錄被刪了 | 不會，`git worktree prune` 清掉 |
+`status` shows a Chinese label; `status --json` gives the `state` key.
 
-「拿走」記在 git 給每個 worktree 的管理目錄（`.git/worktrees/<id>/wtpool.json`），並用
-`git worktree lock` 鎖住，避免被 `git worktree remove` / `prune` 誤刪。挑 worktree 時有互斥鎖，
-好幾個 session 同時 `take` 也不會拿到同一個。
+| `state` | Label | Meaning | Does `take` use it? |
+| --- | --- | --- | --- |
+| `idle` | 閒置 | On the base branch (detached), no changes | Yes |
+| `done` | 可回收 | Its branch has been merged into the base, no changes | Yes (the branch is kept) |
+| `busy` | 使用中 | Taken, or has uncommitted changes | No |
+| `stale` | 可能沒在用 | Taken longer than `staleAfterHours` with no commits | No; `sweep --stale` puts it back |
+| `warming` | 準備中 | Installing dependencies | No |
+| `missing` | 不見了 | Its directory was deleted | No; clean it up with `git worktree prune` |
 
-## 指令
+A take is recorded in the worktree's git admin directory (`.git/worktrees/<id>/wtpool.json`) and the worktree is
+locked with `git worktree lock`, so `git worktree remove` / `prune` won't delete it by accident. Picking a worktree
+happens under a mutex, so several sessions running `take` at once never get the same one.
 
-| 指令 | 說明 |
+## Commands
+
+| Command | What it does |
 | --- | --- |
-| `init [數量]` | 沒有 `.wtpool.json` 就產生一份，再把 worktree 補到指定數量（預設 `size`） |
-| `status [--json]` | 列出每個 worktree 的狀態 |
-| `take <分支> [--slot wN] [--from <ref>]` | 挑一個閒著的開分支，只把路徑印到 stdout。分支已存在就切過去；只在 origin 有就接著 origin 的做 |
-| `release [wN\|分支\|路徑] [--stash]` | 放回：切回基準分支、裝好套件，分支留著。有未提交的變更會拒絕，`--stash` 先收進 `git stash` |
-| `add [數量]` | 多開幾個 |
-| `remove <wN>` | 移除一個閒置的（整個目錄刪掉） |
-| `refresh` | 把閒置的更新到最新的基準分支並裝好套件 |
-| `sweep [--stale]` | 放回分支已合併的；`--stale` 連「可能沒在用」的也放回 |
-| `which` | 目前目錄在哪個 worktree |
-| `hook create\|remove` | 給 Claude Code 的 hook 用，從 stdin 讀 JSON，見下面 |
+| `init [count]` | Writes `.wtpool.json` if missing, then creates worktrees up to `count` (default: `size`) |
+| `status [--json]` | Lists every worktree and its state |
+| `take <branch> [--slot wN] [--from <ref>]` | Takes an idle worktree and creates the branch, printing only the path on stdout. An existing branch is checked out; a branch that exists only on origin continues from origin |
+| `release [wN\|branch\|path] [--stash]` | Puts a worktree back: switches to the base branch and refreshes dependencies, keeping the branch. Refuses if there are uncommitted changes; `--stash` stashes them first |
+| `add [count]` | Adds more worktrees |
+| `remove <wN>` | Removes an idle worktree (deletes its directory) |
+| `refresh` | Moves idle worktrees to the latest base branch and refreshes dependencies |
+| `sweep [--stale]` | Puts back worktrees whose branch has been merged; `--stale` also puts back "maybe unused" ones |
+| `which` | Shows which worktree the current directory is in |
+| `hook create\|remove` | For Claude Code's hooks; reads JSON on stdin, see below |
 
-共用參數：`--no-fetch` 不先 fetch、`--quiet` 不印過程。
+Common flags: `--no-fetch` skips the fetch, `--quiet` hides progress output.
 
-結束碼：`0` 成功、`1` 錯誤、`2` 沒有閒著的 worktree。
+Exit codes: `0` success, `1` error, `2` no idle worktree.
 
-## 跟 Claude Code 的整合
+## Claude Code integration
 
-plugin 在 `hooks/hooks.json` 掛了 `WorktreeCreate` 和 `WorktreeRemove` 兩個 command hook：
+The plugin registers two command hooks in `hooks/hooks.json`, `WorktreeCreate` and `WorktreeRemove`:
 
-- **建立**（`wtpool hook create`）：
-  - 有 `.wtpool.json`：挑一個閒著的 worktree 開 `wt/<名稱>` 分支並回傳路徑，需要的話先裝好套件。
-    池子都在忙時，照 Claude Code 的做法在 `.claude/worktrees/<名稱>` 另開一個（池子不會自己變大）。
-  - 沒有 `.wtpool.json`：照 Claude Code 的做法開在 `.claude/worktrees/<名稱>`，分支 `worktree-<名稱>`，
-    並照 `.worktreeinclude` 複製檔案（支援一般路徑和根目錄的萬用字元）。
-- **移除**（`wtpool hook remove`）：
-  - 池子的 worktree 放回池子而不是刪掉：未提交的變更收進 `git stash`，沒有 commit 的 `wt/*` 分支刪掉、
-    有 commit 的留著，套件在背景重裝。
-  - `.claude/worktrees/` 底下的照 Claude Code 的做法刪掉，未提交的變更一樣先收進 `git stash`，
-    分支已經合併才刪。
+- **Create** (`wtpool hook create`):
+  - With `.wtpool.json`: takes an idle worktree, creates a `wt/<name>` branch and returns its path, installing
+    dependencies first if needed. When every worktree is busy it creates one the way Claude Code does, in
+    `.claude/worktrees/<name>`; the pool never grows on its own.
+  - Without `.wtpool.json`: creates the worktree the way Claude Code does, in `.claude/worktrees/<name>` on branch
+    `worktree-<name>`, and copies the files listed in `.worktreeinclude` (plain paths, plus wildcards at the root level).
+- **Remove** (`wtpool hook remove`):
+  - A pool worktree is put back rather than deleted: uncommitted changes go to `git stash`, a `wt/*` branch with no
+    commits is deleted while one with commits is kept, and dependencies are refreshed in the background.
+  - A worktree under `.claude/worktrees/` is deleted the way Claude Code does it. Uncommitted changes are stashed
+    first, and its branch is deleted only if it has been merged.
 
-為什麼不用 plugin 的 hook 模組（`hooks.modules`）：實測 Claude Code 2.1.318 內建的安全模組不讓使用者層級的
-hook 模組接手 `WorktreeCreate`，而且 `claude --worktree` 啟動時 worktree 會在 hook 模組載入前就建好，
-所以只能用 command hook。代價是 command hook 沒辦法「這次不管、交回 Claude Code」，才需要上面那套照做的邏輯。
+Why not a plugin hooks module (`hooks.modules`): with Claude Code 2.1.318, the built-in security module doesn't let
+user-level hooks modules take over `WorktreeCreate`, and `claude --worktree` creates its worktree before hooks
+modules load. Only command hooks work. The cost is that a command hook can't hand a request back to Claude Code,
+which is why wtpool reproduces Claude Code's own behavior for the cases above.
 
-注意：subagent 和 workflow 結束時 Claude Code 不會呼叫 `WorktreeRemove`，它們拿走的 worktree 要靠
-`wtpool sweep`（分支合併後）或 `wtpool sweep --stale`（沒有 commit、放了很久）放回。
+Note: Claude Code doesn't call `WorktreeRemove` when a subagent or workflow finishes. Put those worktrees back with
+`wtpool sweep` (after the branch is merged) or `wtpool sweep --stale` (no commits, left for a long time).
 
-## 開發
+## Development
 
 ```
-npm test        # node --test，用暫存目錄建 repo 跟本機的 bare origin 實際跑
+npm test        # node --test; builds throwaway repos with a local bare origin and runs the real CLI
 claude plugin validate .
 ```

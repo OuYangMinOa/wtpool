@@ -1,0 +1,14 @@
+{
+  "name": "wtpool",
+  "owner": {
+    "name": "OuYangMinOa"
+  },
+  "description": "wtpool：預熱好的 git worktree 池",
+  "plugins": [
+    {
+      "name": "wtpool",
+      "source": "./",
+      "description": "預熱好的 git worktree 池：開分支時直接拿現成的 worktree，node_modules 和編譯產物都留著"
+    }
+  ]
+}

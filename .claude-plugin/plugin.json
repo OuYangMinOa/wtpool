@@ -1,0 +1,10 @@
+{
+  "name": "wtpool",
+  "version": "0.1.0",
+  "description": "預熱好的 git worktree 池：開分支時直接拿現成的 worktree，node_modules 和編譯產物都留著，不用重裝重編",
+  "author": { "name": "OuYangMinOa" },
+  "homepage": "https://github.com/OuYangMinOa/wtpool",
+  "repository": "https://github.com/OuYangMinOa/wtpool",
+  "license": "MIT",
+  "keywords": ["git", "worktree", "monorepo"]
+}

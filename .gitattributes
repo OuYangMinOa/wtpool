@@ -1,0 +1,2 @@
+# 一律用 LF，cli/wtpool.mjs 的 shebang 在 macOS / Linux 才跑得起來
+* text=auto eol=lf

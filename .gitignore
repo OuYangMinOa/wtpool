@@ -1,0 +1,3 @@
+node_modules/
+# Claude Code 載入 plugin 時寫的型別檔
+.claude-plugin/types/

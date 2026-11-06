@@ -1,0 +1,20 @@
+{
+  "name": "wtpool",
+  "version": "0.1.0",
+  "description": "預熱好的 git worktree 池：開分支時直接拿現成的 worktree，node_modules 和編譯產物都留著",
+  "license": "MIT",
+  "repository": "github:OuYangMinOa/wtpool",
+  "type": "module",
+  "bin": {
+    "wtpool": "cli/wtpool.mjs"
+  },
+  "files": [
+    "cli/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/wtpool.test.mjs"
+  }
+}

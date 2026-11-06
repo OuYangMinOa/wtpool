@@ -1,6 +1,6 @@
 {
   "name": "wtpool",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A pool of warm git worktrees: branch off in a worktree that already has node_modules and build output, no reinstall or rebuild",
   "author": {
     "name": "OuYangMinOa"

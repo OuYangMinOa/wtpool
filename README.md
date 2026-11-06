@@ -143,7 +143,9 @@ Each step is `{ "run", "cwd", "watch", "ifMissing" }`, or just a command string:
 - `run`: the command, run through the system shell (cmd.exe on Windows). `WTPOOL_SLOT` (the number) and
   `WTPOOL_PATH` are set in its environment.
 - `cwd`: the subdirectory to run it in; defaults to the repo root.
-- `watch`: rerun only when these files differ between the old and new commit (usually lockfiles).
+- `watch`: rerun only when these files differ between the old and new commit (usually lockfiles). On `release`, the
+  branch's own last commit and any stashed changes count too, so a lockfile changed on the branch is undone even if
+  the branch is never merged.
 - `ifMissing`: rerun when this path doesn't exist (usually `node_modules`).
 
 New worktrees, and worktrees whose last preparation failed, run every step. Otherwise only the steps whose
@@ -156,7 +158,7 @@ New worktrees, and worktrees whose last preparation failed, run every step. Othe
 | `state` | Label | Meaning | Does `take` use it? |
 | --- | --- | --- | --- |
 | `idle` | idle | On the base branch (detached), no changes | Yes |
-| `done` | reclaimable | Its branch has been merged into the base, no changes | Yes (the branch is kept) |
+| `done` | reclaimable | Its branch has been merged into the base (merge, squash or rebase), no changes | Yes (the branch is kept) |
 | `busy` | in use | Taken, or has uncommitted changes | No |
 | `stale` | maybe unused | Taken longer than `staleAfterHours` with no commits | No; `sweep --stale` puts it back |
 | `warming` | preparing | Installing dependencies | No |
@@ -173,7 +175,7 @@ happens under a mutex, so several sessions running `take` at once never get the 
 | `init [count]` | Writes `.wtpool.json` if missing, then creates worktrees up to `count` (default: `size`) |
 | `status [--json]` | Lists every worktree and its state |
 | `take <branch> [--slot wN] [--from <ref>]` | Takes an idle worktree and creates the branch, printing only the path on stdout. An existing branch is checked out; a branch that exists only on origin continues from origin |
-| `release [wN\|branch\|path] [--stash]` | Puts a worktree back: switches to the base branch and refreshes dependencies, keeping the branch. Refuses if there are uncommitted changes; `--stash` stashes them first |
+| `release [wN\|branch\|path] [--stash]` | Puts a worktree back: switches to the base branch and refreshes dependencies, keeping the branch. Refuses if there are uncommitted changes; `--stash` sets them aside first under `refs/wtpool/stash/` (not the `git stash` list every worktree shares); `git stash apply <ref>` brings them back |
 | `add [count]` | Adds more worktrees |
 | `remove <wN>` | Removes an idle worktree (deletes its directory) |
 | `refresh` | Moves idle worktrees to the latest base branch and refreshes dependencies |
@@ -181,7 +183,8 @@ happens under a mutex, so several sessions running `take` at once never get the 
 | `which` | Shows which worktree the current directory is in |
 | `hook create\|remove` | For Claude Code's hooks; reads JSON on stdin, see below |
 
-Common flags: `--no-fetch` skips the fetch, `--quiet` hides progress output.
+Common flags: `--no-fetch` skips the fetch, `--quiet` hides progress output. `status` fetches only the base branch;
+the other commands fetch the whole remote.
 
 Exit codes: `0` success, `1` error, `2` no idle worktree.
 
@@ -214,10 +217,11 @@ The plugin registers two command hooks in `hooks/hooks.json`, `WorktreeCreate` a
   - Without `.wtpool.json`: creates the worktree the way Claude Code does, in `.claude/worktrees/<name>` on branch
     `worktree-<name>`, and copies the files listed in `.worktreeinclude` (plain paths, plus wildcards at the root level).
 - **Remove** (`wtpool hook remove`):
-  - A pool worktree is put back rather than deleted: uncommitted changes go to `git stash`, a `wt/*` branch with no
-    commits is deleted while one with commits is kept, and dependencies are refreshed in the background.
-  - A worktree under `.claude/worktrees/` is deleted the way Claude Code does it. Uncommitted changes are stashed
-    first, and its branch is deleted only if it has been merged.
+  - A pool worktree is put back rather than deleted: uncommitted changes are set aside under `refs/wtpool/stash/`, a
+    `wt/*` branch that is merged (or has no commits) is deleted while one with unmerged commits is kept, and
+    dependencies are refreshed in the background.
+  - A worktree under `.claude/worktrees/` is deleted the way Claude Code does it. Uncommitted changes are set aside
+    the same way first, and its branch is deleted only if it has been merged.
 
 Why not a plugin hooks module (`hooks.modules`): with Claude Code 2.1.318, the built-in security module doesn't let
 user-level hooks modules take over `WorktreeCreate`, and `claude --worktree` creates its worktree before hooks

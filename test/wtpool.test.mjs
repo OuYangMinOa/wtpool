@@ -124,16 +124,25 @@ function sandbox(t, config = {}) {
   return { root, repo, pool: path.join(root, 'pool'), slot: n => path.join(root, 'pool', `slot${n}`) }
 }
 
-// 在 origin/dev 上多一個 commit（模擬別人合併了東西）
-function pushToDev(s, file, text) {
+// 在 origin/dev 上做點事再推上去（模擬別人合併了東西）
+function onDev(s, fn) {
   const tmp = path.join(s.root, `tmp-${Date.now()}`)
   git(s.repo, 'worktree', 'add', '--quiet', '--detach', tmp, 'origin/dev')
-  write(tmp, file, text)
-  git(tmp, 'add', file)
-  git(tmp, 'commit', '--quiet', '-m', `change ${file}`)
+  fn(tmp)
   git(tmp, 'push', '--quiet', 'origin', 'HEAD:dev')
   git(s.repo, 'worktree', 'remove', '--force', tmp)
   git(s.repo, 'fetch', '--quiet', 'origin')
+}
+const pushToDev = (s, file, text) =>
+  onDev(s, tmp => {
+    write(tmp, file, text)
+    git(tmp, 'add', file)
+    git(tmp, 'commit', '--quiet', '-m', `change ${file}`)
+  })
+const commitFile = (cwd, file, text) => {
+  write(cwd, file, text)
+  git(cwd, 'add', file)
+  git(cwd, 'commit', '--quiet', '-m', `${file}: ${text.trim()}`)
 }
 
 const states = s => JSON.parse(wt(s.repo, ['status', '--json', '--no-fetch']).out).slots.map(x => x.state)
@@ -201,13 +210,62 @@ test('release：有未提交的變更就拒絕，--stash 收起來；分支留�
   assert.equal(refused.code, 1)
   assert.match(refused.err, /未提交/)
 
+  write(p, '.gitignore', `${read(p, '.gitignore')}# 改了追蹤中的檔案\n`)
   const r = wt(p, ['release', '--stash'])
   assert.equal(r.code, 0, r.err)
-  assert.match(git(s.repo, 'stash', 'list'), /wtpool: feature\/a/)
+  assert.equal(git(s.repo, 'stash', 'list'), '', '不進所有 worktree 共用的 git stash')
+  const ref = git(s.repo, 'for-each-ref', '--format=%(refname)', 'refs/wtpool/stash/')
+  assert.match(ref, /^refs\/wtpool\/stash\/w1-\d+T\d+Z$/)
+  assert.ok(r.err.includes(`git stash apply ${ref}`), r.err)
   assert.equal(gitOk(p, 'symbolic-ref', '-q', 'HEAD'), false) // detached
   assert.ok(gitOk(s.repo, 'rev-parse', '--verify', 'refs/heads/feature/a'))
   assert.doesNotMatch(git(s.repo, 'worktree', 'list', '--porcelain'), /locked/)
   assert.deepEqual(states(s), ['idle', 'idle'])
+
+  // 拿得回來，沒追蹤的檔案也在
+  git(p, 'switch', '--quiet', 'feature/a')
+  git(p, 'stash', 'apply', '--quiet', ref)
+  assert.equal(read(p, 'draft.txt'), 'wip')
+  assert.match(read(p, '.gitignore'), /改了追蹤中的檔案/)
+})
+
+test('release：分支上改了 lockfile（commit 了或收起來），沒合併就放回也要重裝', async t => {
+  const s = sandbox(t, { size: 1 })
+  wt(s.repo, ['init'])
+  const a = wt(s.repo, ['take', 'feature/bump']).out
+  commitFile(a, 'deps.lock', 'v2\n')
+  assert.equal(wt(a, ['release']).code, 0)
+  assert.equal(warmCount(s.slot(1)), 2, '分支上的 lockfile 跟基準不同，要照基準重裝')
+  assert.equal(wt(s.repo, ['refresh']).code, 0)
+  assert.equal(warmCount(s.slot(1)), 2, '裝過了就不再裝')
+
+  const b = wt(s.repo, ['take', 'feature/dirty']).out
+  write(b, 'deps.lock', 'v3\n')
+  assert.equal(wt(b, ['release', '--stash']).code, 0)
+  assert.equal(warmCount(s.slot(1)), 3, '沒 commit 的 lockfile 變更也算')
+
+  // hook 放回是在背景裝
+  const c = wt(s.repo, ['hook', 'create'], { input: JSON.stringify({ name: 'bump', cwd: s.repo }) }).out
+  commitFile(c, 'deps.lock', 'v4\n')
+  assert.equal(wt(s.repo, ['hook', 'remove'], { input: JSON.stringify({ worktree_path: c }) }).code, 0)
+  assert.ok(await waitFor(() => warmCount(s.slot(1)) === 4), '背景也要重裝')
+})
+
+test('take：裝套件失敗以後再 take 一次會重裝，不會直接給沒裝好的', t => {
+  const s = sandbox(t, { size: 1 })
+  wt(s.repo, ['init'])
+  pushToDev(s, 'deps.lock', 'v2\n')
+  const failed = wt(s.repo, ['take', 'feature/a'], { env: { WARM_FAIL: '1' } })
+  assert.equal(failed.code, 1)
+  const st = JSON.parse(wt(s.repo, ['status', '--json', '--no-fetch']).out).slots[0]
+  assert.equal(st.state, 'busy')
+  assert.match(st.note, /準備失敗.*wtpool take feature\/a/)
+
+  const again = wt(s.repo, ['take', 'feature/a'])
+  assert.equal(again.code, 0, again.err)
+  assert.equal(warmCount(s.slot(1)), 3, '重跑一次')
+  assert.equal(wt(s.repo, ['take', 'feature/a']).code, 0)
+  assert.equal(warmCount(s.slot(1)), 3, '裝好了就不再裝')
 })
 
 test('setup：只有 watch 的檔案變了才重跑', t => {
@@ -258,6 +316,95 @@ test('sweep：分支合併進基準以後放回', t => {
   assert.equal(r.code, 0, r.err)
   assert.deepEqual(states(s), ['idle', 'idle'])
   assert.ok(gitOk(s.repo, 'rev-parse', '--verify', 'refs/heads/feature/done'), '自己取名的分支不刪')
+})
+
+test('sweep：squash 合併、rebase 合併也認得', t => {
+  const s = sandbox(t)
+  wt(s.repo, ['init'])
+  const sq = wt(s.repo, ['take', 'feature/sq']).out
+  commitFile(sq, 'a.txt', '1\n')
+  commitFile(sq, 'a.txt', '2\n')
+  git(sq, 'push', '--quiet', '-u', 'origin', 'HEAD')
+  const rb = wt(s.repo, ['take', 'feature/rb']).out
+  commitFile(rb, 'b.txt', '1\n')
+  commitFile(rb, 'b.txt', '2\n')
+  assert.deepEqual(states(s), ['busy', 'busy'])
+
+  pushToDev(s, 'other.txt', 'someone else\n') // 基準先往前走，合併出來的 commit 才不會剛好是同一個
+  onDev(s, tmp => {
+    git(tmp, 'merge', '--quiet', '--squash', 'feature/sq')
+    git(tmp, 'commit', '--quiet', '-m', 'Squash feature/sq (#1)')
+    git(tmp, 'cherry-pick', 'origin/dev..feature/rb')
+  })
+  git(s.repo, 'push', '--quiet', 'origin', ':feature/sq') // GitHub 合併完刪掉分支
+  assert.deepEqual(states(s), ['done', 'done'])
+
+  const r = wt(s.repo, ['sweep'])
+  assert.equal(r.code, 0, r.err)
+  assert.doesNotMatch(r.err, /commit/, '已經合併了，不要說還有 commit 沒進去')
+  assert.deepEqual(states(s), ['idle', 'idle'])
+})
+
+test('status：遠端分支被刪了只提示，不當成可回收', t => {
+  const s = sandbox(t, { size: 1 })
+  wt(s.repo, ['init'])
+  const p = wt(s.repo, ['take', 'feature/closed']).out
+  commitFile(p, 'c.txt', 'wip\n')
+  git(p, 'push', '--quiet', '-u', 'origin', 'HEAD')
+  git(s.repo, 'push', '--quiet', 'origin', ':feature/closed') // PR 沒合併就關掉、分支刪了
+  git(s.repo, 'fetch', '--quiet', '--prune', 'origin')
+  const st = JSON.parse(wt(s.repo, ['status', '--json', '--no-fetch']).out).slots[0]
+  assert.equal(st.state, 'busy')
+  assert.match(st.note, /遠端的分支已經刪掉/)
+})
+
+test('hook remove：squash 合併過的 wt/* 分支會刪掉', t => {
+  const s = sandbox(t, { size: 1 })
+  wt(s.repo, ['init'])
+  const p = wt(s.repo, ['hook', 'create'], { input: JSON.stringify({ name: 'sq', cwd: s.repo }) }).out
+  commitFile(p, 'a.txt', '1\n')
+  commitFile(p, 'a.txt', '2\n')
+  pushToDev(s, 'other.txt', 'x\n')
+  onDev(s, tmp => {
+    git(tmp, 'merge', '--quiet', '--squash', 'wt/sq')
+    git(tmp, 'commit', '--quiet', '-m', 'squash')
+  })
+  const r = wt(s.repo, ['hook', 'remove'], { input: JSON.stringify({ worktree_path: p }) })
+  assert.equal(r.code, 0, r.err)
+  assert.equal(gitOk(s.repo, 'rev-parse', '--verify', 'refs/heads/wt/sq'), false)
+})
+
+test('--no-fetch：每個指令都不 fetch；status 預設只抓基準分支', t => {
+  const s = sandbox(t, { size: 1 })
+  wt(s.repo, ['init'])
+  git(s.repo, 'remote', 'set-url', 'origin', path.join(s.root, 'nowhere.git'))
+  for (const args of [['status'], ['add'], ['sweep'], ['refresh'], ['init', '3']]) {
+    const r = wt(s.repo, [...args, '--no-fetch'])
+    assert.equal(r.code, 0, `${args.join(' ')}: ${r.err}`)
+    assert.doesNotMatch(r.err, /fetch/, args.join(' '))
+  }
+  assert.match(wt(s.repo, ['status']).err, /git fetch origin 失敗/, '沒加 --no-fetch 會試著抓')
+})
+
+test('init：認得 Yarn 2 以上和 PnP', t => {
+  const root = tempDir(t)
+  const cases = [
+    { files: {}, run: 'yarn install --frozen-lockfile', ifMissing: 'node_modules' },
+    { files: { '.yarnrc.yml': 'enableGlobalCache: true\n' }, run: 'yarn install --immutable', ifMissing: '.pnp.cjs' },
+    { files: { '.yarnrc.yml': 'nodeLinker: node-modules\n' }, run: 'yarn install --immutable', ifMissing: 'node_modules' },
+    { files: { 'package.json': '{"packageManager":"yarn@4.5.0"}' }, run: 'yarn install --immutable', ifMissing: '.pnp.cjs' },
+  ]
+  cases.forEach((c, i) => {
+    const repo = path.join(root, `y${i}`)
+    fs.mkdirSync(repo)
+    git(repo, 'init', '--quiet')
+    write(repo, 'yarn.lock', '')
+    for (const [f, text] of Object.entries(c.files)) write(repo, f, text)
+    const r = wt(repo, ['init', '0', '--no-fetch'])
+    assert.equal(r.code, 0, r.err)
+    const [step] = JSON.parse(read(repo, '.wtpool.json')).setup
+    assert.deepEqual([step.run, step.ifMissing], [c.run, c.ifMissing], JSON.stringify(c.files))
+  })
 })
 
 test('hook：沒有 .wtpool.json 的 repo 照 Claude Code 的做法開', t => {

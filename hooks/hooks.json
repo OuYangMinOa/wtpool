@@ -3,7 +3,7 @@
     "WorktreeCreate": [
       {
         "hooks": [
-          { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/skills/wtpool/scripts/wtpool.mjs", "hook", "create"] }
+          { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/skills/wtpool/scripts/wtpool.mjs", "hook", "create"], "timeout": 600 }
         ]
       }
     ],

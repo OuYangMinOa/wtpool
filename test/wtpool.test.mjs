@@ -8,6 +8,8 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const CLI = fileURLToPath(new URL('../cli/wtpool.mjs', import.meta.url))
+// 既有的斷言用中文訊息，預設固定用 zh-TW 跑；英文另外測
+const BASE_ENV = { WTPOOL_LANG: 'zh-TW' }
 
 const write = (dir, file, text) => fs.writeFileSync(path.join(dir, file), text)
 const read = (dir, file) => fs.readFileSync(path.join(dir, file), 'utf8')
@@ -33,7 +35,7 @@ function wt(cwd, args, { input, env } = {}) {
     input,
     encoding: 'utf8',
     windowsHide: true,
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...BASE_ENV, ...env },
   })
   return { code: r.status, out: r.stdout.trim(), err: r.stderr.trim() }
 }
@@ -42,7 +44,11 @@ function wt(cwd, args, { input, env } = {}) {
 function wtAsync(cwd, args, { input, env } = {}) {
   return new Promise(resolve => {
     const started = Date.now()
-    const child = spawn(process.execPath, [CLI, ...args], { cwd, env: { ...process.env, ...env }, windowsHide: true })
+    const child = spawn(process.execPath, [CLI, ...args], {
+      cwd,
+      env: { ...process.env, ...BASE_ENV, ...env },
+      windowsHide: true,
+    })
     let out = ''
     let err = ''
     child.stdout.on('data', d => (out += d))
@@ -386,4 +392,46 @@ test('remove：只能移除閒置的', t => {
   assert.equal(r.code, 0, r.err)
   assert.equal(fs.existsSync(s.slot(2)), false)
   assert.deepEqual(states(s), ['busy'])
+})
+
+test('WTPOOL_LANG=en：訊息、狀態、說明都是英文', t => {
+  const s = sandbox(t, { size: 1 })
+  const en = { env: { WTPOOL_LANG: 'en' } }
+  wt(s.repo, ['init'], en)
+  assert.match(wt(s.repo, ['status', '--no-fetch'], en).out, /^w1\s+idle\s/m)
+  assert.equal(JSON.parse(wt(s.repo, ['status', '--json', '--no-fetch'], en).out).slots[0].label, 'idle')
+  const a = wt(s.repo, ['take', 'feature/a'], en)
+  assert.equal(a.code, 0, a.err)
+  assert.match(a.err, /w1: feature\/a \(new branch from origin\/dev\)/)
+  const busy = wt(s.repo, ['take', 'feature/b'], en)
+  assert.equal(busy.code, 2)
+  assert.match(busy.err, /No idle worktree/)
+  assert.match(busy.out, /in use/)
+  write(a.out, 'draft.txt', 'wip')
+  assert.match(wt(a.out, ['release'], en).err, /^error: w1 has uncommitted changes/)
+  assert.match(wt(s.repo, ['help'], en).out, /Usage: wtpool <command>/)
+  assert.match(wt(s.repo, ['nope'], en).err, /unknown command: nope/)
+  assert.doesNotMatch(wt(s.repo, ['help'], en).out, /[一-鿿]/, '英文說明裡不該有中文')
+})
+
+test('WTPOOL_LANG：zh、zh_TW、大小寫都認得；沒設就看系統語言', t => {
+  const s = sandbox(t)
+  for (const v of ['zh', 'zh_TW', 'ZH-tw']) {
+    assert.match(wt(s.repo, ['help'], { env: { WTPOOL_LANG: v } }).out, /用法：wtpool/, v)
+  }
+  for (const v of ['en', 'EN_us']) {
+    assert.match(wt(s.repo, ['help'], { env: { WTPOOL_LANG: v } }).out, /Usage: wtpool/, v)
+  }
+  if (process.platform !== 'win32') {
+    const auto = env => wt(s.repo, ['help'], { env: { WTPOOL_LANG: '', LC_ALL: '', LC_MESSAGES: '', ...env } }).out
+    assert.match(auto({ LANG: 'zh_TW.UTF-8' }), /用法：wtpool/)
+    assert.match(auto({ LANG: 'en_US.UTF-8' }), /Usage: wtpool/)
+  }
+})
+
+test('設定檔錯誤用英文也說清楚', t => {
+  const s = sandbox(t, { sise: 3 })
+  const r = wt(s.repo, ['status', '--no-fetch'], { env: { WTPOOL_LANG: 'en' } })
+  assert.equal(r.code, 1)
+  assert.match(r.err, /unknown field\(s\) sise/)
 })

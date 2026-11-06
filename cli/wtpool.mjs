@@ -5,14 +5,14 @@
 // 接到需求時挑一個閒著的開分支，做完放回去，下一個需求就不用重裝、重編。
 // 設定寫在 repo 根目錄的 .wtpool.json，說明見 README.md。
 //
-// 只用 Node 內建模組，Node 18 以上就能跑。
+// 只用 Node 內建模組，Node 18 以上就能跑。訊息有英文和繁體中文，用 WTPOOL_LANG 切換。
 
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const SELF = fileURLToPath(import.meta.url)
 const CONFIG_FILE = '.wtpool.json'
 const META_FILE = 'wtpool.json'
@@ -34,16 +34,149 @@ const DEFAULTS = Object.freeze({
 })
 const STEP_KEYS = ['run', 'cwd', 'watch', 'ifMissing']
 
-const STATE_LABEL = {
-  idle: '閒置',
-  done: '可回收',
-  stale: '可能沒在用',
-  busy: '使用中',
-  warming: '準備中',
-  missing: '不見了',
-}
+// ---------- 訊息 ----------
 
-const HELP = `wtpool ${VERSION}：預熱好的 git worktree 池
+const MESSAGES = {
+  en: {
+    states: {
+      idle: 'idle',
+      done: 'reclaimable',
+      stale: 'maybe unused',
+      busy: 'in use',
+      warming: 'preparing',
+      missing: 'missing',
+    },
+    help: () => `wtpool ${VERSION}: a pool of warm git worktrees
+
+Usage: wtpool <command> [options]
+
+  init [count]           write ${CONFIG_FILE} if missing, then create worktrees up to count
+  status [--json]        list every worktree and its state
+  take <branch> [--slot wN] [--from <ref>]
+                         take an idle worktree and create the branch (or check out an existing one);
+                         prints only the path on stdout
+  release [wN|branch|path] [--stash]
+                         put a worktree back: switch to the base branch and refresh dependencies;
+                         the branch is kept
+  add [count]            add more worktrees
+  remove <wN>            remove an idle worktree (deletes its directory)
+  refresh                move idle worktrees to the latest base branch and refresh dependencies
+  sweep [--stale]        put back worktrees whose branch is merged; --stale also those with no commits for long
+  which                  show which worktree the current directory is in
+  hook create|remove     for Claude Code's WorktreeCreate / WorktreeRemove hooks; reads JSON on stdin
+
+Options: --no-fetch skips git fetch, --quiet hides progress
+Language: WTPOOL_LANG=en or zh-TW (default: the system language)
+Exit codes: 0 success, 1 error, 2 no idle worktree`,
+    gitFailed: (cmd, why) => `git ${cmd} failed: ${why}`,
+    exitCode: code => `exit code ${code}`,
+    cfgUnreadable: why => `can't parse ${CONFIG_FILE}: ${why}`,
+    cfgBad: msg => `${CONFIG_FILE}: ${msg}`,
+    cfgNotObject: 'it must be a JSON object',
+    cfgUnknown: (keys, known) => `unknown field(s) ${keys} (known: ${known})`,
+    cfgBase: '"base" must be a branch name, e.g. "origin/main"',
+    cfgDir: '"dir" must be a path',
+    cfgName: '"name" must contain exactly one {n} and no slashes, e.g. "w{n}"',
+    cfgSize: '"size" must be an integer of 0 or more',
+    cfgHookBranch: '"hookBranch" must contain exactly one {name}, e.g. "wt/{name}"',
+    cfgCopy: '"copy" must be an array of paths',
+    cfgStale: '"staleAfterHours" must be a positive number',
+    cfgSetup: '"setup" must be an array',
+    stepRun: i => `setup[${i}] needs "run"`,
+    stepUnknown: (i, keys, known) => `setup[${i}] has unknown field(s) ${keys} (known: ${known})`,
+    stepWatch: i => `setup[${i}].watch must be a path or an array of paths`,
+    stepIfMissing: i => `setup[${i}].ifMissing must be a path`,
+    stepCwd: i => `setup[${i}].cwd must be a path`,
+    listFailed: why => `git worktree list failed: ${why}`,
+    noLockReason: '(no reason given)',
+    notGitRepo: cwd => `${cwd} is not inside a git repository`,
+    bareRepo: 'bare repositories are not supported',
+    notConfigured: main => `${main} has no ${CONFIG_FILE} yet; run wtpool init first`,
+    noBase: `can't find the base branch; set "base" in ${CONFIG_FILE} (e.g. "origin/main")`,
+    timedOut: s => `timed out after ${s} s`,
+    fetchFailed: (remote, why, base) => `warning: git fetch ${remote} failed (${why}); using the local ${base}`,
+    lockBusy: pid => `another wtpool (pid ${pid}) is working on this repo; try again shortly`,
+    noteMissing: 'its directory is gone (git worktree prune cleans it up)',
+    noteWarming: 'preparing (updating or installing dependencies)',
+    noteDirty: 'in use (uncommitted changes)',
+    noteLocked: reason => `locked by git worktree lock: ${reason}`,
+    noteIdleFailed: 'idle (last preparation failed; it will rerun)',
+    noteMerged: base => `branch merged into ${base}`,
+    noteStale: hours => `taken ${hours} hours ago with no commits`,
+    slotNotFound: key => `no worktree ${key}`,
+    notInSlotPick: 'the current directory is not in a wtpool worktree; say which one (e.g. w2)',
+    runStep: (name, run, cwd) => `  ${name}: ${run}${cwd ? ` (in ${cwd})` : ''}`,
+    prepFailed: (name, run, why) => `${name}: preparation failed: ${run} (${why})`,
+    copyNotFile: rel => `warning: only files can be copied; skipping ${rel}`,
+    copyNotIgnored: rel => `warning: ${rel} is not gitignored; skipping`,
+    copied: (label, rel) => `  ${label}: copied ${rel}`,
+    branchExistsFrom: b => `branch ${b} already exists, so --from can't be used`,
+    descExisting: 'existing branch',
+    descFrom: ref => `new branch from ${ref}`,
+    descRemote: ref => `continuing ${ref}`,
+    refNotFound: ref => `can't find ${ref}`,
+    baseNotFound: (base, canFetch) => `can't find ${base}${canFetch ? ' (try git fetch)' : ''}`,
+    badBranch: b => `invalid branch name: ${b}`,
+    branchElsewhere: (b, p) => `${b} is already checked out at ${p}`,
+    slotUnavailable: (name, label, note) => `${name} can't be used now: ${label} (${note})`,
+    reuse: (b, name) => `${b} is already in ${name}; reusing it`,
+    took: (name, desc, b) => `${name}: ${b} (${desc})`,
+    slotWarming: name => `${name} is being prepared; release it a little later`,
+    slotDirty: name =>
+      `${name} has uncommitted changes; commit or clean them up first (or add --stash to keep them in git stash)`,
+    stashRelease: what => `wtpool: ${what} — uncommitted changes before release`,
+    stashRemove: what => `wtpool: ${what} — uncommitted changes before removal`,
+    noteStashed: 'uncommitted changes were saved to git stash (see git stash list)',
+    noteStashedShort: 'uncommitted changes were saved to git stash',
+    noteAhead: (b, n, base) => `branch ${b} has ${n} commit(s) not in ${base}; the branch is kept`,
+    noteDeletedMerged: b => `deleted merged branch ${b}`,
+    released: (name, base) => `${name} released (${base}, detached)`,
+    pathTaken: p => `${p} already exists but is not a worktree of this repo; check what's in it first`,
+    creating: (n, base, p) => `creating w${n} (${base}) → ${p}`,
+    updated: (name, base) => `${name}: updated to ${base}`,
+    nothingToRefresh: 'no idle worktrees to update',
+    nothingToSweep: 'no worktrees to put back',
+    removeOnlyIdle: (name, label) => `${name} is "${label}"; only idle worktrees can be removed`,
+    removing: (name, p) => `removing ${name}: ${p}`,
+    removed: name => `${name} removed`,
+    wroteConfig: file => `wrote ${file}; check that base and setup are right, then commit it`,
+    statusHeader: (dir, base) => `wtpool: ${dir} (base ${base ?? 'not set'})`,
+    statusNoConfig: `this repo has no ${CONFIG_FILE} yet; run wtpool init`,
+    statusEmpty: 'no worktrees yet; run wtpool init',
+    hookTty: "hook commands read Claude Code's JSON from stdin",
+    hookBadJson: 'stdin is not JSON',
+    nativeTaken: dir => `${dir} already exists but is not a worktree of this repo`,
+    nativeCreated: (dir, b, start) => `wtpool: created ${dir} (${b}, from ${start})`,
+    nativeNotOurs: p => `${p} was not created by wtpool; leaving it alone`,
+    removeFailed: why => `git worktree remove failed: ${why}`,
+    emptyDirLeft: p => `the empty directory ${p} can't be deleted yet; remove it later`,
+    noteDeletedBranch: b => `deleted branch ${b}`,
+    noteKeptBranch: b => `branch ${b} has unmerged commits; kept`,
+    hookBusy: 'wtpool: no idle worktree, so this one is created the way Claude Code does (wtpool add grows the pool)',
+    hookReleased: name => `wtpool: ${name} is back in the pool`,
+    hookRemoved: 'wtpool: worktree removed',
+    sep: '; ',
+    needsValue: key => `--${key} needs a value`,
+    badCount: v => `count must be an integer of 0 or more: ${v}`,
+    usageHook: 'usage: wtpool hook create|remove',
+    usageTake: 'usage: wtpool take <branch> [--slot wN] [--from <ref>]',
+    usageRemove: 'usage: wtpool remove <wN>',
+    noIdle: '\nNo idle worktree. To add one, run: wtpool add',
+    notInSlot: 'the current directory is not in a wtpool worktree',
+    unknownCommand: cmd => `unknown command: ${cmd} (see wtpool help)`,
+    errorPrefix: 'error: ',
+  },
+
+  'zh-TW': {
+    states: {
+      idle: '閒置',
+      done: '可回收',
+      stale: '可能沒在用',
+      busy: '使用中',
+      warming: '準備中',
+      missing: '不見了',
+    },
+    help: () => `wtpool ${VERSION}：預熱好的 git worktree 池
 
 用法：wtpool <指令> [參數]
 
@@ -61,7 +194,127 @@ const HELP = `wtpool ${VERSION}：預熱好的 git worktree 池
   hook create|remove     給 Claude Code 的 WorktreeCreate / WorktreeRemove hook 用，從 stdin 讀 JSON
 
 共用參數：--no-fetch 不先 git fetch，--quiet 不印過程
-結束碼：0 成功，1 錯誤，2 沒有閒著的 worktree`
+語言：WTPOOL_LANG=en 或 zh-TW（沒設就跟系統語言）
+結束碼：0 成功，1 錯誤，2 沒有閒著的 worktree`,
+    gitFailed: (cmd, why) => `git ${cmd} 失敗：${why}`,
+    exitCode: code => `結束碼 ${code}`,
+    cfgUnreadable: why => `${CONFIG_FILE} 讀不懂：${why}`,
+    cfgBad: msg => `${CONFIG_FILE}：${msg}`,
+    cfgNotObject: '內容要是一個 JSON 物件',
+    cfgUnknown: (keys, known) => `有不認得的欄位 ${keys}（可用的有 ${known}）`,
+    cfgBase: '"base" 要是分支名稱，例如 "origin/main"',
+    cfgDir: '"dir" 要是路徑',
+    cfgName: '"name" 要剛好含一個 {n}、不能有斜線，例如 "w{n}"',
+    cfgSize: '"size" 要是 0 以上的整數',
+    cfgHookBranch: '"hookBranch" 要剛好含一個 {name}，例如 "wt/{name}"',
+    cfgCopy: '"copy" 要是路徑的陣列',
+    cfgStale: '"staleAfterHours" 要是正數',
+    cfgSetup: '"setup" 要是陣列',
+    stepRun: i => `setup[${i}] 要有 "run"`,
+    stepUnknown: (i, keys, known) => `setup[${i}] 有不認得的欄位 ${keys}（可用的有 ${known}）`,
+    stepWatch: i => `setup[${i}].watch 要是路徑或路徑的陣列`,
+    stepIfMissing: i => `setup[${i}].ifMissing 要是路徑`,
+    stepCwd: i => `setup[${i}].cwd 要是路徑`,
+    listFailed: why => `git worktree list 失敗：${why}`,
+    noLockReason: '（沒寫原因）',
+    notGitRepo: cwd => `${cwd} 不在 git repo 裡`,
+    bareRepo: '不支援 bare repo',
+    notConfigured: main => `${main} 還沒有 ${CONFIG_FILE}，先跑 wtpool init`,
+    noBase: `找不到基準分支，請在 ${CONFIG_FILE} 設定 "base"（例如 "origin/main"）`,
+    timedOut: s => `超過 ${s} 秒`,
+    fetchFailed: (remote, why, base) => `警告：git fetch ${remote} 失敗（${why}），先用本機現有的 ${base}`,
+    lockBusy: pid => `另一個 wtpool（pid ${pid}）正在處理這個 repo，稍後再試`,
+    noteMissing: '目錄不見了（可以跑 git worktree prune 清掉）',
+    noteWarming: '準備中（正在更新或安裝套件）',
+    noteDirty: '使用中（有未提交的變更）',
+    noteLocked: reason => `被 git worktree lock 鎖住：${reason}`,
+    noteIdleFailed: '閒置（上次準備失敗，下次會重跑）',
+    noteMerged: base => `分支已合併進 ${base}`,
+    noteStale: hours => `拿走 ${hours} 小時都沒有 commit`,
+    slotNotFound: key => `找不到 worktree ${key}`,
+    notInSlotPick: '目前目錄不在 wtpool 的 worktree 裡，請指定要哪一個（例如 w2）',
+    runStep: (name, run, cwd) => `  ${name}：${run}${cwd ? `（在 ${cwd}）` : ''}`,
+    prepFailed: (name, run, why) => `${name} 準備失敗：${run}（${why}）`,
+    copyNotFile: rel => `警告：只能複製檔案，略過 ${rel}`,
+    copyNotIgnored: rel => `警告：${rel} 沒有被 .gitignore 忽略，略過`,
+    copied: (label, rel) => `  ${label}：複製 ${rel}`,
+    branchExistsFrom: b => `分支 ${b} 已經存在，不能再指定 --from`,
+    descExisting: '切到既有的分支',
+    descFrom: ref => `從 ${ref} 開新分支`,
+    descRemote: ref => `從 ${ref} 接著做`,
+    refNotFound: ref => `找不到 ${ref}`,
+    baseNotFound: (base, canFetch) => `找不到 ${base}${canFetch ? '（先 git fetch 看看）' : ''}`,
+    badBranch: b => `分支名稱不合法：${b}`,
+    branchElsewhere: (b, p) => `${b} 已經在 ${p} 用著了`,
+    slotUnavailable: (name, label, note) => `${name} 現在不能用：${label}（${note}）`,
+    reuse: (b, name) => `${b} 已經在 ${name}，沿用`,
+    took: (name, desc, b) => `${name}：${desc} ${b}`,
+    slotWarming: name => `${name} 正在準備中，等一下再放回`,
+    slotDirty: name => `${name} 有未提交的變更，先 commit 或清掉再放回（確定不要了可以加 --stash 收進 git stash）`,
+    stashRelease: what => `wtpool: ${what} 放回前沒提交的變更`,
+    stashRemove: what => `wtpool: ${what} 移除前沒提交的變更`,
+    noteStashed: '沒提交的變更收進了 git stash（git stash list 看得到）',
+    noteStashedShort: '沒提交的變更收進了 git stash',
+    noteAhead: (b, n, base) => `分支 ${b} 還有 ${n} 個 commit 沒進 ${base}，分支會留著`,
+    noteDeletedMerged: b => `已刪除合併過的分支 ${b}`,
+    released: (name, base) => `${name} 已放回（${base}，detached）`,
+    pathTaken: p => `${p} 已經存在，但不是這個 repo 的 worktree，請先確認裡面的東西`,
+    creating: (n, base, p) => `建立 w${n}（${base}）→ ${p}`,
+    updated: (name, base) => `${name}：已更新到 ${base}`,
+    nothingToRefresh: '沒有閒置的 worktree 要更新',
+    nothingToSweep: '沒有可以放回的 worktree',
+    removeOnlyIdle: (name, label) => `${name} 現在是「${label}」，只能移除閒置的`,
+    removing: (name, p) => `移除 ${name}：${p}`,
+    removed: name => `${name} 已移除`,
+    wroteConfig: file => `已產生 ${file}，請確認 base 和 setup 對不對，再 commit 進 repo`,
+    statusHeader: (dir, base) => `wtpool：${dir}（基準 ${base ?? '未設定'}）`,
+    statusNoConfig: `這個 repo 還沒有 ${CONFIG_FILE}，先跑 wtpool init`,
+    statusEmpty: '還沒有 worktree，先跑 wtpool init',
+    hookTty: 'hook 指令要從 stdin 讀 Claude Code 給的 JSON',
+    hookBadJson: 'stdin 不是 JSON',
+    nativeTaken: dir => `${dir} 已經存在，但不是這個 repo 的 worktree`,
+    nativeCreated: (dir, b, start) => `wtpool：開了 ${dir}（${b}，從 ${start}）`,
+    nativeNotOurs: p => `${p} 不是 wtpool 開的 worktree，先留著`,
+    removeFailed: why => `git worktree remove 失敗：${why}`,
+    emptyDirLeft: p => `空目錄 ${p} 暫時刪不掉，可以之後再刪`,
+    noteDeletedBranch: b => `已刪除分支 ${b}`,
+    noteKeptBranch: b => `分支 ${b} 有還沒合併的 commit，留著`,
+    hookBusy: 'wtpool：沒有閒著的 worktree，這次照 Claude Code 的做法另開一個（wtpool add 可以多開）',
+    hookReleased: name => `wtpool：${name} 已放回池子`,
+    hookRemoved: 'wtpool：已移除 worktree',
+    sep: '；',
+    needsValue: key => `--${key} 後面要接值`,
+    badCount: v => `數量要是 0 以上的整數：${v}`,
+    usageHook: '用法：wtpool hook create|remove',
+    usageTake: '用法：wtpool take <分支> [--slot wN] [--from <ref>]',
+    usageRemove: '用法：wtpool remove <wN>',
+    noIdle: '\n沒有閒著的 worktree。要多開一個就跑：wtpool add',
+    notInSlot: '目前目錄不在 wtpool 的 worktree 裡',
+    unknownCommand: cmd => `不認得的指令：${cmd}（wtpool help 看用法）`,
+    errorPrefix: '錯誤：',
+  },
+}
+
+// 語言：WTPOOL_LANG（en、zh-TW）優先；沒設的話 Windows 看系統的顯示語言（Git Bash 一律把 LANG 設成
+// en_US，不準），其他系統看 LC_ALL / LC_MESSAGES / LANG。都不是中文就用英文。
+function pickLang(env = process.env) {
+  const tidy = v =>
+    String(v ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/_/g, '-')
+  const wanted = tidy(env.WTPOOL_LANG)
+  if (wanted.startsWith('zh')) return 'zh-TW'
+  if (wanted.startsWith('en')) return 'en'
+  let intl = ''
+  try {
+    intl = Intl.DateTimeFormat().resolvedOptions().locale
+  } catch {}
+  const sys = IS_WIN ? intl : env.LC_ALL || env.LC_MESSAGES || env.LANG || intl
+  return tidy(sys).startsWith('zh') ? 'zh-TW' : 'en'
+}
+
+const M = MESSAGES[pickLang()]
 
 class WtError extends Error {
   constructor(message, code = EXIT.ERROR) {
@@ -109,9 +362,7 @@ function git(args, { cwd, timeout, allowFail = false } = {}) {
     err: (r.stderr ?? '').trim() || (r.error ? r.error.message : ''),
     timedOut: r.error?.code === 'ETIMEDOUT',
   }
-  if (!res.ok && !allowFail) {
-    throw new WtError(`git ${args.join(' ')} 失敗：${res.err || `結束碼 ${r.status}`}`)
-  }
+  if (!res.ok && !allowFail) throw new WtError(M.gitFailed(args.join(' '), res.err || M.exitCode(r.status)))
   return res
 }
 const gitOk = (args, cwd) => git(args, { cwd, allowFail: true }).ok
@@ -129,37 +380,33 @@ function loadConfig(file) {
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''))
   } catch (e) {
-    throw new WtError(`${CONFIG_FILE} 讀不懂：${e.message}`)
+    throw new WtError(M.cfgUnreadable(e.message))
   }
   const bad = msg => {
-    throw new WtError(`${CONFIG_FILE}：${msg}`)
+    throw new WtError(M.cfgBad(msg))
   }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('內容要是一個 JSON 物件')
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad(M.cfgNotObject)
   const unknown = Object.keys(raw).filter(k => k !== '$schema' && !(k in DEFAULTS))
-  if (unknown.length) bad(`有不認得的欄位 ${unknown.join(', ')}（可用的有 ${Object.keys(DEFAULTS).join(', ')}）`)
+  if (unknown.length) bad(M.cfgUnknown(unknown.join(', '), Object.keys(DEFAULTS).join(', ')))
 
   const cfg = { ...DEFAULTS, ...raw }
-  if (cfg.base !== null && (typeof cfg.base !== 'string' || !cfg.base)) bad('"base" 要是分支名稱，例如 "origin/main"')
-  if (typeof cfg.dir !== 'string' || !cfg.dir) bad('"dir" 要是路徑')
-  if (typeof cfg.name !== 'string' || cfg.name.split('{n}').length !== 2 || /[\\/]/.test(cfg.name)) {
-    bad('"name" 要剛好含一個 {n}、不能有斜線，例如 "w{n}"')
-  }
-  if (!Number.isInteger(cfg.size) || cfg.size < 0) bad('"size" 要是 0 以上的整數')
-  if (typeof cfg.hookBranch !== 'string' || cfg.hookBranch.split('{name}').length !== 2) {
-    bad('"hookBranch" 要剛好含一個 {name}，例如 "wt/{name}"')
-  }
-  if (!Array.isArray(cfg.copy) || cfg.copy.some(c => typeof c !== 'string' || !c)) bad('"copy" 要是路徑的陣列')
-  if (typeof cfg.staleAfterHours !== 'number' || !(cfg.staleAfterHours > 0)) bad('"staleAfterHours" 要是正數')
-  if (!Array.isArray(cfg.setup)) bad('"setup" 要是陣列')
+  if (cfg.base !== null && (typeof cfg.base !== 'string' || !cfg.base)) bad(M.cfgBase)
+  if (typeof cfg.dir !== 'string' || !cfg.dir) bad(M.cfgDir)
+  if (typeof cfg.name !== 'string' || cfg.name.split('{n}').length !== 2 || /[\\/]/.test(cfg.name)) bad(M.cfgName)
+  if (!Number.isInteger(cfg.size) || cfg.size < 0) bad(M.cfgSize)
+  if (typeof cfg.hookBranch !== 'string' || cfg.hookBranch.split('{name}').length !== 2) bad(M.cfgHookBranch)
+  if (!Array.isArray(cfg.copy) || cfg.copy.some(c => typeof c !== 'string' || !c)) bad(M.cfgCopy)
+  if (typeof cfg.staleAfterHours !== 'number' || !(cfg.staleAfterHours > 0)) bad(M.cfgStale)
+  if (!Array.isArray(cfg.setup)) bad(M.cfgSetup)
   cfg.setup = cfg.setup.map((step, i) => {
     const s = typeof step === 'string' ? { run: step } : step
-    if (!s || typeof s !== 'object' || typeof s.run !== 'string' || !s.run) bad(`setup[${i}] 要有 "run"`)
+    if (!s || typeof s !== 'object' || typeof s.run !== 'string' || !s.run) bad(M.stepRun(i))
     const extra = Object.keys(s).filter(k => !STEP_KEYS.includes(k))
-    if (extra.length) bad(`setup[${i}] 有不認得的欄位 ${extra.join(', ')}（可用的有 ${STEP_KEYS.join(', ')}）`)
+    if (extra.length) bad(M.stepUnknown(i, extra.join(', '), STEP_KEYS.join(', ')))
     const watch = s.watch === undefined ? [] : Array.isArray(s.watch) ? s.watch : [s.watch]
-    if (watch.some(w => typeof w !== 'string' || !w)) bad(`setup[${i}].watch 要是路徑或路徑的陣列`)
-    if (s.ifMissing !== undefined && (typeof s.ifMissing !== 'string' || !s.ifMissing)) bad(`setup[${i}].ifMissing 要是路徑`)
-    if (s.cwd !== undefined && (typeof s.cwd !== 'string' || !s.cwd)) bad(`setup[${i}].cwd 要是路徑`)
+    if (watch.some(w => typeof w !== 'string' || !w)) bad(M.stepWatch(i))
+    if (s.ifMissing !== undefined && (typeof s.ifMissing !== 'string' || !s.ifMissing)) bad(M.stepIfMissing(i))
+    if (s.cwd !== undefined && (typeof s.cwd !== 'string' || !s.cwd)) bad(M.stepCwd(i))
     return { run: s.run, cwd: s.cwd, watch, ifMissing: s.ifMissing }
   })
   return cfg
@@ -172,9 +419,7 @@ function listWorktrees(cwd) {
     windowsHide: true,
     maxBuffer: 64 << 20,
   })
-  if (r.error || r.status !== 0) {
-    throw new WtError(`git worktree list 失敗：${(r.stderr || r.error?.message || '').trim()}`)
-  }
+  if (r.error || r.status !== 0) throw new WtError(M.listFailed((r.stderr || r.error?.message || '').trim()))
   const list = []
   let cur = null
   for (const field of r.stdout.split('\0')) {
@@ -190,7 +435,7 @@ function listWorktrees(cwd) {
     else if (!cur) continue
     else if (key === 'HEAD') cur.head = val
     else if (key === 'branch') cur.branch = val.replace(/^refs\/heads\//, '')
-    else if (key === 'locked') cur.locked = val || '（沒寫原因）'
+    else if (key === 'locked') cur.locked = val || M.noLockReason
     else if (key === 'bare') cur.bare = true
   }
   if (cur) list.push(cur)
@@ -205,10 +450,10 @@ function detectBase(main) {
 }
 
 function getContext(cwd) {
-  if (!gitOk(['rev-parse', '--show-toplevel'], cwd)) throw new WtError(`${cwd} 不在 git repo 裡`)
+  if (!gitOk(['rev-parse', '--show-toplevel'], cwd)) throw new WtError(M.notGitRepo(cwd))
   const common = path.resolve(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd }).out)
   const mainWt = listWorktrees(cwd)[0]
-  if (!mainWt || mainWt.bare) throw new WtError('不支援 bare repo')
+  if (!mainWt || mainWt.bare) throw new WtError(M.bareRepo)
   const main = mainWt.path
   const cfgFile = path.join(main, CONFIG_FILE)
   const configured = fs.existsSync(cfgFile)
@@ -238,11 +483,11 @@ function getContext(cwd) {
 }
 
 function requireConfig(ctx) {
-  if (!ctx.configured) throw new WtError(`${ctx.main} 還沒有 ${CONFIG_FILE}，先跑 wtpool init`)
+  if (!ctx.configured) throw new WtError(M.notConfigured(ctx.main))
 }
 
 function requireBase(ctx) {
-  if (!ctx.base) throw new WtError(`找不到基準分支，請在 ${CONFIG_FILE} 設定 "base"（例如 "origin/main"）`)
+  if (!ctx.base) throw new WtError(M.noBase)
   return ctx.base
 }
 
@@ -250,8 +495,7 @@ function fetchBase(ctx, { timeout = 120_000 } = {}) {
   if (!ctx.remote) return
   const r = git(['fetch', '--quiet', '--prune', ctx.remote], { cwd: ctx.main, timeout, allowFail: true })
   if (r.ok) return
-  const why = r.timedOut ? `超過 ${timeout / 1000} 秒` : r.err
-  log(`警告：git fetch ${ctx.remote} 失敗（${why}），先用本機現有的 ${ctx.base}`)
+  log(M.fetchFailed(ctx.remote, r.timedOut ? M.timedOut(timeout / 1000) : r.err, ctx.base))
 }
 
 // ---------- 互斥鎖：挑 worktree、改狀態時一次只讓一個 wtpool 做 ----------
@@ -288,9 +532,7 @@ function withLock(ctx, fn, waitMs = 30_000) {
         } catch {}
         continue
       }
-      if (Date.now() - started > waitMs) {
-        throw new WtError(`另一個 wtpool（pid ${holder?.pid ?? '?'}）正在處理這個 repo，稍後再試`)
-      }
+      if (Date.now() - started > waitMs) throw new WtError(M.lockBusy(holder?.pid ?? '?'))
       sleep(100)
     }
   }
@@ -346,47 +588,47 @@ function clearWarmLease(slot) {
 
 function inspect(ctx, slot) {
   const set = (state, note) => Object.assign(slot, { state, note })
-  if (!fs.existsSync(slot.path)) return set('missing', '目錄不見了（可以跑 git worktree prune 清掉）')
+  if (!fs.existsSync(slot.path)) return set('missing', M.noteMissing)
   slot.admin = path.resolve(git(['rev-parse', '--absolute-git-dir'], { cwd: slot.path }).out)
   slot.meta = readMeta(slot)
   slot.headRev = git(['rev-parse', 'HEAD'], { cwd: slot.path }).out
   slot.dirty = git(['status', '--porcelain'], { cwd: slot.path }).out !== ''
   const lease = slot.meta.lease
 
-  if (lease?.kind === 'warm' && isAlive(lease.pid)) return set('warming', '準備中（正在更新或安裝套件）')
-  if (slot.dirty) return set('busy', '使用中（有未提交的變更）')
+  if (lease?.kind === 'warm' && isAlive(lease.pid)) return set('warming', M.noteWarming)
+  if (slot.dirty) return set('busy', M.noteDirty)
   if (!slot.branch) {
-    if (slot.locked && lease?.kind !== 'take') return set('busy', `被 git worktree lock 鎖住：${slot.locked}`)
-    return set('idle', slot.meta.warm?.ok === false ? '閒置（上次準備失敗，下次會重跑）' : '閒置')
+    if (slot.locked && lease?.kind !== 'take') return set('busy', M.noteLocked(slot.locked))
+    return set('idle', slot.meta.warm?.ok === false ? M.noteIdleFailed : M.states.idle)
   }
 
   const merged = Boolean(ctx.base) && gitOk(['merge-base', '--is-ancestor', 'HEAD', ctx.base], slot.path)
   if (lease?.kind === 'take' && lease.branch === slot.branch) {
-    if (merged && slot.headRev !== lease.startRev) return set('done', `分支已合併進 ${ctx.base}`)
+    if (merged && slot.headRev !== lease.startRev) return set('done', M.noteMerged(ctx.base))
     const hours = (Date.now() - Date.parse(lease.since)) / 36e5
     if (slot.headRev === lease.startRev && hours >= ctx.cfg.staleAfterHours) {
-      return set('stale', `拿走 ${Math.floor(hours)} 小時都沒有 commit`)
+      return set('stale', M.noteStale(Math.floor(hours)))
     }
-    return set('busy', '使用中')
+    return set('busy', M.states.busy)
   }
   // 沒有 wtpool 的租約（舊版腳本拿的、或手動切的分支）：推過而且全部合併才算做完
   const upstream = git(['config', '--get', `branch.${slot.branch}.merge`], { cwd: ctx.main, allowFail: true }).out
-  if (merged && upstream && upstream !== `refs/heads/${ctx.baseBranch}`) return set('done', `分支已合併進 ${ctx.base}`)
-  return set('busy', '使用中')
+  if (merged && upstream && upstream !== `refs/heads/${ctx.baseBranch}`) return set('done', M.noteMerged(ctx.base))
+  return set('busy', M.states.busy)
 }
 
 function pickSlot(slots, key) {
   const k = String(key)
   const m = /^w?(\d+)$/i.exec(k)
   const slot = slots.find(s => (m && s.n === Number(m[1])) || path.basename(s.path).toLowerCase() === k.toLowerCase())
-  if (!slot) throw new WtError(`找不到 worktree ${key}`)
+  if (!slot) throw new WtError(M.slotNotFound(key))
   return slot
 }
 
 function resolveSlot(ctx, slots, key) {
   if (!key) {
     const here = slots.find(s => isInside(ctx.cwd, s.path))
-    if (!here) throw new WtError('目前目錄不在 wtpool 的 worktree 裡，請指定要哪一個（例如 w2）')
+    if (!here) throw new WtError(M.notInSlotPick)
     return here
   }
   const byBranch = slots.find(s => s.branch === key)
@@ -417,7 +659,7 @@ function warmSteps(ctx, slot, targetRev) {
 function runWarm(ctx, slot, steps) {
   const rev = git(['rev-parse', 'HEAD'], { cwd: slot.path }).out
   for (const step of steps) {
-    log(`  ${slot.name}：${step.run}${step.cwd ? `（在 ${step.cwd}）` : ''}`)
+    log(M.runStep(slot.name, step.run, step.cwd))
     const r = spawnSync(step.run, {
       cwd: path.join(slot.path, step.cwd ?? '.'),
       shell: true,
@@ -429,7 +671,7 @@ function runWarm(ctx, slot, steps) {
       updateMeta(slot, m => {
         m.warm = { ok: false, rev: m.warm?.rev ?? null, at: now() }
       })
-      throw new WtError(`${slot.name} 準備失敗：${step.run}（${r.error?.message ?? `結束碼 ${r.status}`}）`)
+      throw new WtError(M.prepFailed(slot.name, step.run, r.error?.message ?? M.exitCode(r.status)))
     }
   }
   updateMeta(slot, m => {
@@ -448,11 +690,11 @@ function copyIgnored(main, dest, rel, label) {
     return
   }
   if (!st.isFile()) {
-    log(`警告：只能複製檔案，略過 ${rel}`)
+    log(M.copyNotFile(rel))
     return
   }
   if (!gitOk(['check-ignore', '--quiet', rel], main)) {
-    log(`警告：${rel} 沒有被 .gitignore 忽略，略過`)
+    log(M.copyNotIgnored(rel))
     return
   }
   try {
@@ -460,7 +702,7 @@ function copyIgnored(main, dest, rel, label) {
   } catch {}
   fs.mkdirSync(path.dirname(dst), { recursive: true })
   fs.copyFileSync(src, dst)
-  log(`  ${label}：複製 ${rel}`)
+  log(M.copied(label, rel))
 }
 
 function copyFiles(ctx, slot) {
@@ -491,29 +733,30 @@ function spawnBackground(ctx, args) {
 function resolveTarget(ctx, branch, from) {
   const local = revParse(`refs/heads/${branch}`, ctx.main)
   if (local) {
-    if (from) throw new WtError(`分支 ${branch} 已經存在，不能再指定 --from`)
-    return { args: [branch], rev: local, desc: '切到既有的分支' }
+    if (from) throw new WtError(M.branchExistsFrom(branch))
+    return { args: [branch], rev: local, desc: M.descExisting }
   }
   if (from) {
     const rev = revParse(from, ctx.main)
-    if (!rev) throw new WtError(`找不到 ${from}`)
-    return { args: ['--no-track', '-c', branch, from], rev, desc: `從 ${from} 開新分支` }
+    if (!rev) throw new WtError(M.refNotFound(from))
+    return { args: ['--no-track', '-c', branch, from], rev, desc: M.descFrom(from) }
   }
   if (ctx.remote) {
-    const rev = revParse(`refs/remotes/${ctx.remote}/${branch}`, ctx.main)
-    if (rev) return { args: ['--track', '-c', branch, `${ctx.remote}/${branch}`], rev, desc: `從 ${ctx.remote}/${branch} 接著做` }
+    const remoteRef = `${ctx.remote}/${branch}`
+    const rev = revParse(`refs/remotes/${remoteRef}`, ctx.main)
+    if (rev) return { args: ['--track', '-c', branch, remoteRef], rev, desc: M.descRemote(remoteRef) }
   }
   const rev = revParse(ctx.base, ctx.main)
-  if (!rev) throw new WtError(`找不到 ${ctx.base}${ctx.remote ? '（先 git fetch 看看）' : ''}`)
+  if (!rev) throw new WtError(M.baseNotFound(ctx.base, Boolean(ctx.remote)))
   // --no-track：不要把基準分支設成 upstream，免得之後 git push 推到基準分支
-  return { args: ['--no-track', '-c', branch, ctx.base], rev, desc: `從 ${ctx.base} 開新分支` }
+  return { args: ['--no-track', '-c', branch, ctx.base], rev, desc: M.descFrom(ctx.base) }
 }
 
 // opts.hook：從 Claude Code 的 hook 呼叫，fetch 不要等太久
 function take(ctx, branch, opts = {}) {
   requireConfig(ctx)
   requireBase(ctx)
-  if (!gitOk(['check-ref-format', '--branch', branch], ctx.main)) throw new WtError(`分支名稱不合法：${branch}`)
+  if (!gitOk(['check-ref-format', '--branch', branch], ctx.main)) throw new WtError(M.badBranch(branch))
   if (!opts.noFetch) fetchBase(ctx, { timeout: opts.hook ? 10_000 : 120_000 })
 
   const picked = withLock(ctx, () => {
@@ -521,13 +764,13 @@ function take(ctx, branch, opts = {}) {
     const mine = slots.find(s => s.branch === branch)
     if (mine) return { slot: mine, again: true }
     const elsewhere = listWorktrees(ctx.main).find(w => w.branch === branch)
-    if (elsewhere) throw new WtError(`${branch} 已經在 ${elsewhere.path} 用著了`)
+    if (elsewhere) throw new WtError(M.branchElsewhere(branch, elsewhere.path))
 
     const target = resolveTarget(ctx, branch, opts.from)
     let usable = slots.filter(s => s.state === 'idle' || s.state === 'done')
     if (opts.slot) {
       const s = pickSlot(slots, opts.slot)
-      if (!usable.includes(s)) throw new WtError(`${s.name} 現在不能用：${STATE_LABEL[s.state]}（${s.note}）`)
+      if (!usable.includes(s)) throw new WtError(M.slotUnavailable(s.name, M.states[s.state], s.note))
       usable = [s]
     }
     // 不用重裝套件的優先，再來是閒置的優先
@@ -554,12 +797,12 @@ function take(ctx, branch, opts = {}) {
   if (picked.busy) return picked
   const { slot } = picked
   if (picked.again) {
-    log(`${branch} 已經在 ${slot.name}，沿用`)
+    log(M.reuse(branch, slot.name))
     return picked
   }
   copyFiles(ctx, slot)
   runWarm(ctx, slot, picked.steps)
-  log(`${slot.name}：${picked.desc} ${branch}`)
+  log(M.took(slot.name, picked.desc, branch))
   return picked
 }
 
@@ -574,25 +817,24 @@ function release(ctx, key, opts = {}) {
     const slots = findSlots(ctx).map(s => inspect(ctx, s))
     const slot = resolveSlot(ctx, slots, key)
     if (slot.state === 'missing') throw new WtError(`${slot.name} ${slot.note}`)
-    if (slot.state === 'warming') throw new WtError(`${slot.name} 正在準備中，等一下再放回`)
+    if (slot.state === 'warming') throw new WtError(M.slotWarming(slot.name))
     const notes = []
     if (slot.dirty) {
-      if (!opts.stash) {
-        throw new WtError(`${slot.name} 有未提交的變更，先 commit 或清掉再放回（確定不要了可以加 --stash 收進 git stash）`)
-      }
-      const label = `wtpool: ${slot.branch ?? slot.name} 放回前沒提交的變更`
-      git(['stash', 'push', '--include-untracked', '--message', label], { cwd: slot.path })
-      notes.push('沒提交的變更收進了 git stash（git stash list 看得到）')
+      if (!opts.stash) throw new WtError(M.slotDirty(slot.name))
+      git(['stash', 'push', '--include-untracked', '--message', M.stashRelease(slot.branch ?? slot.name)], {
+        cwd: slot.path,
+      })
+      notes.push(M.noteStashed)
     }
     const branch = slot.branch
     if (branch) {
       const ahead = Number(git(['rev-list', '--count', `${ctx.base}..HEAD`], { cwd: slot.path, allowFail: true }).out || 0)
-      if (ahead > 0) notes.push(`分支 ${branch} 還有 ${ahead} 個 commit 沒進 ${ctx.base}，分支會留著`)
+      if (ahead > 0) notes.push(M.noteAhead(branch, ahead, ctx.base))
     }
     git(['switch', '--quiet', '--detach', ctx.base], { cwd: slot.path })
     git(['worktree', 'unlock', slot.path], { cwd: ctx.main, allowFail: true })
     const del = opts.deleteBranch === true || (opts.deleteBranch === 'hook' && ctx.hookRe.test(branch ?? ''))
-    if (branch && del && gitOk(['branch', '-d', branch], slot.path)) notes.push(`已刪除合併過的分支 ${branch}`)
+    if (branch && del && gitOk(['branch', '-d', branch], slot.path)) notes.push(M.noteDeletedMerged(branch))
     updateMeta(slot, m => {
       m.lease = opts.background ? null : { kind: 'warm', pid: process.pid, since: now() }
     })
@@ -611,7 +853,7 @@ function release(ctx, key, opts = {}) {
     }
   }
   for (const note of r.notes) log(note)
-  log(`${slot.name} 已放回（${ctx.base}，detached）`)
+  log(M.released(slot.name, ctx.base))
   return r
 }
 
@@ -619,7 +861,7 @@ function add(ctx, count = 1) {
   requireConfig(ctx)
   requireBase(ctx)
   fetchBase(ctx)
-  if (!revParse(ctx.base, ctx.main)) throw new WtError(`找不到 ${ctx.base}`)
+  if (!revParse(ctx.base, ctx.main)) throw new WtError(M.refNotFound(ctx.base))
 
   const created = withLock(ctx, () => {
     const used = new Set(findSlots(ctx).map(s => s.n))
@@ -627,9 +869,9 @@ function add(ctx, count = 1) {
     for (let n = 1; made.length < count; n++) {
       if (used.has(n)) continue
       const p = path.join(ctx.poolDir, ctx.cfg.name.replace('{n}', String(n)))
-      if (fs.existsSync(p)) throw new WtError(`${p} 已經存在，但不是這個 repo 的 worktree，請先確認裡面的東西`)
+      if (fs.existsSync(p)) throw new WtError(M.pathTaken(p))
       fs.mkdirSync(ctx.poolDir, { recursive: true })
-      log(`建立 w${n}（${ctx.base}）→ ${p}`)
+      log(M.creating(n, ctx.base, p))
       git(['worktree', 'add', '--quiet', '--detach', p, ctx.base], { cwd: ctx.main })
       const slot = findSlots(ctx).find(s => s.n === n)
       slot.admin = path.resolve(git(['rev-parse', '--absolute-git-dir'], { cwd: p }).out)
@@ -663,7 +905,7 @@ function refresh(ctx, opts = {}) {
   requireBase(ctx)
   if (!opts.noFetch) fetchBase(ctx)
   const baseRev = revParse(ctx.base, ctx.main)
-  if (!baseRev) throw new WtError(`找不到 ${ctx.base}`)
+  if (!baseRev) throw new WtError(M.refNotFound(ctx.base))
 
   const targets = withLock(ctx, () => {
     const idle = findSlots(ctx)
@@ -683,15 +925,15 @@ function refresh(ctx, opts = {}) {
       if (slot.headRev !== baseRev) git(['switch', '--quiet', '--detach', ctx.base], { cwd: slot.path })
       copyFiles(ctx, slot)
       runWarm(ctx, slot, warmSteps(ctx, slot, baseRev))
-      log(`${slot.name}：已更新到 ${ctx.base}`)
+      log(M.updated(slot.name, ctx.base))
     } catch (e) {
       failed++
-      log(`${slot.name}：${e.message}`)
+      log(e.message)
     } finally {
       clearWarmLease(slot)
     }
   }
-  if (!targets.length) log('沒有閒置的 worktree 要更新')
+  if (!targets.length) log(M.nothingToRefresh)
   return failed ? EXIT.ERROR : EXIT.OK
 }
 
@@ -701,14 +943,14 @@ function sweep(ctx, opts = {}) {
   fetchBase(ctx)
   const slots = findSlots(ctx).map(s => inspect(ctx, s))
   const wanted = slots.filter(s => s.state === 'done' || (opts.stale && s.state === 'stale'))
-  if (!wanted.length) log('沒有可以放回的 worktree')
+  if (!wanted.length) log(M.nothingToSweep)
   let failed = 0
   for (const s of wanted) {
     try {
       release(ctx, s.path, { noFetch: true, deleteBranch: 'hook' })
     } catch (e) {
       failed++
-      log(`${s.name}：${e.message}`)
+      log(`${s.name}: ${e.message}`)
     }
   }
   return failed ? EXIT.ERROR : EXIT.OK
@@ -723,13 +965,13 @@ function remove(ctx, key) {
       git(['worktree', 'prune'], { cwd: ctx.main })
       return s
     }
-    if (s.state !== 'idle') throw new WtError(`${s.name} 現在是「${STATE_LABEL[s.state]}」，只能移除閒置的`)
+    if (s.state !== 'idle') throw new WtError(M.removeOnlyIdle(s.name, M.states[s.state]))
     git(['worktree', 'unlock', s.path], { cwd: ctx.main, allowFail: true })
-    log(`移除 ${s.name}：${s.path}`)
+    log(M.removing(s.name, s.path))
     git(['worktree', 'remove', s.path], { cwd: ctx.main })
     return s
   })
-  log(`${slot.name} 已移除`)
+  log(M.removed(slot.name))
 }
 
 // ---------- 範本 ----------
@@ -769,7 +1011,7 @@ function writeTemplate(ctx) {
     setup: detectSetup(ctx.main),
   }
   fs.writeFileSync(ctx.cfgFile, `${JSON.stringify(tmpl, null, 2)}\n`)
-  log(`已產生 ${ctx.cfgFile}，請確認 base 和 setup 對不對，再 commit 進 repo`)
+  log(M.wroteConfig(ctx.cfgFile))
 }
 
 // ---------- 輸出 ----------
@@ -778,13 +1020,14 @@ const width = s => [...s].reduce((w, ch) => w + (ch.codePointAt(0) >= 0x1100 ? 2
 const pad = (s, w) => s + ' '.repeat(Math.max(0, w - width(s)))
 
 function printStatus(ctx, slots) {
-  out(`wtpool：${ctx.poolDir}（基準 ${ctx.base ?? '未設定'}）`)
-  if (!ctx.configured) out(`這個 repo 還沒有 ${CONFIG_FILE}，先跑 wtpool init`)
-  else if (!slots.length) out('還沒有 worktree，先跑 wtpool init')
+  out(M.statusHeader(ctx.poolDir, ctx.base))
+  if (!ctx.configured) out(M.statusNoConfig)
+  else if (!slots.length) out(M.statusEmpty)
+  const labelWidth = Math.max(...Object.values(M.states).map(width)) + 1
   for (const s of slots) {
     const where = s.branch ?? `(detached ${s.headRev ? s.headRev.slice(0, 7) : '?'})`
-    const note = s.note && s.note !== STATE_LABEL[s.state] ? `  ${s.note}` : ''
-    out(`${pad(s.name, 4)} ${pad(STATE_LABEL[s.state], 10)} ${pad(where, 34)}${note}`.trimEnd())
+    const note = s.note && s.note !== M.states[s.state] ? `  ${s.note}` : ''
+    out(`${pad(s.name, 4)} ${pad(M.states[s.state], labelWidth)} ${pad(where, 34)}${note}`.trimEnd())
   }
 }
 
@@ -792,7 +1035,7 @@ const slotJson = s => ({
   name: s.name,
   path: s.path,
   state: s.state,
-  label: STATE_LABEL[s.state],
+  label: M.states[s.state],
   note: s.note,
   branch: s.branch,
   head: s.headRev ?? null,
@@ -803,12 +1046,12 @@ const slotJson = s => ({
 // ---------- hook ----------
 
 function readHookInput() {
-  if (process.stdin.isTTY) throw new WtError('hook 指令要從 stdin 讀 Claude Code 給的 JSON')
+  if (process.stdin.isTTY) throw new WtError(M.hookTty)
   const text = fs.readFileSync(0, 'utf8')
   try {
     return JSON.parse(text || '{}')
   } catch {
-    throw new WtError('stdin 不是 JSON')
+    throw new WtError(M.hookBadJson)
   }
 }
 
@@ -840,7 +1083,8 @@ function copyWorktreeInclude(ctx, dest) {
   for (const line of lines) {
     const pat = line.trim().replace(/^\//, '')
     if (!pat || pat.startsWith('#') || pat.startsWith('!')) continue
-    const rels = /[*?]/.test(pat) && !pat.includes('/') ? fs.readdirSync(ctx.main).filter(n => globToRe(pat).test(n)) : [pat]
+    const rels =
+      /[*?]/.test(pat) && !pat.includes('/') ? fs.readdirSync(ctx.main).filter(n => globToRe(pat).test(n)) : [pat]
     for (const rel of rels) copyIgnored(ctx.main, dest, rel, path.basename(dest))
   }
 }
@@ -848,7 +1092,7 @@ function copyWorktreeInclude(ctx, dest) {
 function nativeCreate(ctx, name, branch) {
   const dir = path.join(nativeDir(ctx), name)
   if (listWorktrees(ctx.main).some(w => samePath(w.path, dir))) return dir // 同一個名字再開，沿用
-  if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new WtError(`${dir} 已經存在，但不是這個 repo 的 worktree`)
+  if (fs.existsSync(dir) && fs.readdirSync(dir).length) throw new WtError(M.nativeTaken(dir))
   fetchBase(ctx, { timeout: 10_000 })
   const start = ctx.base && revParse(ctx.base, ctx.main) ? ctx.base : 'HEAD'
   fs.mkdirSync(nativeDir(ctx), { recursive: true })
@@ -862,34 +1106,35 @@ function nativeCreate(ctx, name, branch) {
   if (revParse(`refs/heads/${branch}`, ctx.main)) git(['worktree', 'add', '--quiet', dir, branch], { cwd: ctx.main })
   else git(['worktree', 'add', '--quiet', '--no-track', '-b', branch, dir, start], { cwd: ctx.main })
   copyWorktreeInclude(ctx, dir)
-  log(`wtpool：開了 ${dir}（${branch}，從 ${start}）`)
+  log(M.nativeCreated(dir, branch, start))
   return dir
 }
 
 function nativeRemove(ctx, p) {
   const info = listWorktrees(ctx.main).find(w => samePath(w.path, p))
-  if (!info || !isInside(p, nativeDir(ctx))) throw new WtError(`${p} 不是 wtpool 開的 worktree，先留著`)
+  if (!info || !isInside(p, nativeDir(ctx))) throw new WtError(M.nativeNotOurs(p))
   const notes = []
   if (git(['status', '--porcelain'], { cwd: p }).out) {
-    const label = `wtpool: ${info.branch ?? path.basename(p)} 移除前沒提交的變更`
-    git(['stash', 'push', '--include-untracked', '--message', label], { cwd: p })
-    notes.push('沒提交的變更收進了 git stash')
+    git(['stash', 'push', '--include-untracked', '--message', M.stashRemove(info.branch ?? path.basename(p))], {
+      cwd: p,
+    })
+    notes.push(M.noteStashedShort)
   }
   git(['worktree', 'unlock', p], { cwd: ctx.main, allowFail: true })
   const rm = git(['worktree', 'remove', '--force', p], { cwd: ctx.main, allowFail: true })
   if (!rm.ok) {
     // Windows 上目錄還被別的程式開著（例如剛離開這裡的 session）時，git 刪完檔案、拿掉登記，卻刪不掉空目錄
-    if (listWorktrees(ctx.main).some(w => samePath(w.path, p))) throw new WtError(`git worktree remove 失敗：${rm.err}`)
+    if (listWorktrees(ctx.main).some(w => samePath(w.path, p))) throw new WtError(M.removeFailed(rm.err))
     try {
       fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
     } catch {
-      notes.push(`空目錄 ${p} 暫時刪不掉，可以之後再刪`)
+      notes.push(M.emptyDirLeft(p))
     }
   }
   if (info.branch) {
     const merged = gitOk(['merge-base', '--is-ancestor', info.branch, ctx.base ?? 'HEAD'], ctx.main)
-    if (merged && gitOk(['branch', '-D', info.branch], ctx.main)) notes.push(`已刪除分支 ${info.branch}`)
-    else notes.push(`分支 ${info.branch} 有還沒合併的 commit，留著`)
+    if (merged && gitOk(['branch', '-D', info.branch], ctx.main)) notes.push(M.noteDeletedBranch(info.branch))
+    else notes.push(M.noteKeptBranch(info.branch))
   }
   return notes
 }
@@ -905,7 +1150,7 @@ function hookCreate() {
   const branch = ctx.cfg.hookBranch.replace('{name}', name)
   const r = take(ctx, branch, { by: `claude:${input.session_id ?? '?'}`, hook: true })
   if (r.busy) {
-    log('wtpool：沒有閒著的 worktree，這次照 Claude Code 的做法另開一個（wtpool add 可以多開）')
+    log(M.hookBusy)
     out(nativeCreate(ctx, name, branch))
     return EXIT.OK
   }
@@ -920,10 +1165,10 @@ function hookRemove() {
   const ctx = getContext(p)
   if (ctx.configured && findSlots(ctx).some(s => samePath(s.path, p))) {
     const r = release(ctx, p, { stash: true, deleteBranch: 'hook', background: true, hook: true })
-    out([`wtpool：${r.slot.name} 已放回池子`, ...r.notes].join('；'))
+    out([M.hookReleased(r.slot.name), ...r.notes].join(M.sep))
     return EXIT.OK
   }
-  out(['wtpool：已移除 worktree', ...nativeRemove(ctx, p)].join('；'))
+  out([M.hookRemoved, ...nativeRemove(ctx, p)].join(M.sep))
   return EXIT.OK
 }
 
@@ -942,7 +1187,7 @@ function parseArgs(argv) {
       const key = a.slice(2, eq < 0 ? undefined : eq)
       if (eq >= 0) flags[key] = a.slice(eq + 1)
       else if (VALUE_FLAGS.has(key)) {
-        if (i + 1 >= argv.length) throw new WtError(`--${key} 後面要接值`)
+        if (i + 1 >= argv.length) throw new WtError(M.needsValue(key))
         flags[key] = argv[++i]
       } else flags[key] = true
     } else pos.push(a)
@@ -953,7 +1198,7 @@ function parseArgs(argv) {
 const toCount = (v, fallback) => {
   if (v === undefined) return fallback
   const n = Number(v)
-  if (!Number.isInteger(n) || n < 0) throw new WtError(`數量要是 0 以上的整數：${v}`)
+  if (!Number.isInteger(n) || n < 0) throw new WtError(M.badCount(v))
   return n
 }
 
@@ -961,7 +1206,7 @@ function main(argv) {
   const { pos, flags } = parseArgs(argv)
   const [cmd = 'status', a1] = pos
   if (flags.help || cmd === 'help') {
-    out(HELP)
+    out(M.help())
     return EXIT.OK
   }
   if (flags.version || cmd === 'version') {
@@ -974,7 +1219,7 @@ function main(argv) {
   if (cmd === 'hook') {
     if (a1 === 'create') return hookCreate()
     if (a1 === 'remove') return hookRemove()
-    throw new WtError('用法：wtpool hook create|remove')
+    throw new WtError(M.usageHook)
   }
 
   let ctx = getContext(process.cwd())
@@ -983,7 +1228,8 @@ function main(argv) {
       if (!noFetch && ctx.base) fetchBase(ctx, { timeout: 30_000 })
       const slots = findSlots(ctx).map(s => inspect(ctx, s))
       if (flags.json) {
-        out(JSON.stringify({ repo: ctx.main, dir: ctx.poolDir, base: ctx.base, configured: ctx.configured, slots: slots.map(slotJson) }, null, 2))
+        const data = { repo: ctx.main, dir: ctx.poolDir, base: ctx.base, configured: ctx.configured }
+        out(JSON.stringify({ ...data, slots: slots.map(slotJson) }, null, 2))
       } else printStatus(ctx, slots)
       return EXIT.OK
     }
@@ -995,20 +1241,26 @@ function main(argv) {
       const want = toCount(a1, ctx.cfg.size)
       const have = findSlots(ctx).length
       if (want > have) add(ctx, want - have)
-      printStatus(ctx, findSlots(ctx).map(s => inspect(ctx, s)))
+      printStatus(
+        ctx,
+        findSlots(ctx).map(s => inspect(ctx, s)),
+      )
       return EXIT.OK
     }
     case 'add': {
       add(ctx, Math.max(1, toCount(a1, 1)))
-      printStatus(ctx, findSlots(ctx).map(s => inspect(ctx, s)))
+      printStatus(
+        ctx,
+        findSlots(ctx).map(s => inspect(ctx, s)),
+      )
       return EXIT.OK
     }
     case 'take': {
-      if (!a1) throw new WtError('用法：wtpool take <分支> [--slot wN] [--from <ref>]')
+      if (!a1) throw new WtError(M.usageTake)
       const r = take(ctx, a1, { slot: flags.slot, from: flags.from, noFetch })
       if (r.busy) {
         if (!quiet) printStatus(ctx, r.slots)
-        log('\n沒有閒著的 worktree。要多開一個就跑：wtpool add')
+        log(M.noIdle)
         return EXIT.BUSY
       }
       out(r.slot.path)
@@ -1023,22 +1275,22 @@ function main(argv) {
     case 'sweep':
       return sweep(ctx, { stale: Boolean(flags.stale) })
     case 'remove': {
-      if (!a1) throw new WtError('用法：wtpool remove <wN>')
+      if (!a1) throw new WtError(M.usageRemove)
       remove(ctx, a1)
       return EXIT.OK
     }
     case 'which': {
       const slot = findSlots(ctx).find(s => isInside(ctx.cwd, s.path))
       if (!slot) {
-        log('目前目錄不在 wtpool 的 worktree 裡')
+        log(M.notInSlot)
         return EXIT.ERROR
       }
       inspect(ctx, slot)
-      out(`${slot.name}\t${STATE_LABEL[slot.state]}\t${slot.branch ?? '(detached)'}\t${slot.path}`)
+      out(`${slot.name}\t${M.states[slot.state]}\t${slot.branch ?? '(detached)'}\t${slot.path}`)
       return EXIT.OK
     }
     default:
-      throw new WtError(`不認得的指令：${cmd}（wtpool help 看用法）`)
+      throw new WtError(M.unknownCommand(cmd))
   }
 }
 
@@ -1046,6 +1298,6 @@ try {
   process.exitCode = main(process.argv.slice(2))
 } catch (e) {
   if (!(e instanceof WtError)) throw e
-  process.stderr.write(`錯誤：${e.message}\n`)
+  process.stderr.write(`${M.errorPrefix}${e.message}\n`)
   process.exitCode = e.code
 }

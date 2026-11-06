@@ -14,8 +14,6 @@ task starts warm.
     `isolation: worktree`, background sessions) and serve them from the pool.
   - A skill tells Claude to `take` before starting work, `release` when done, and ask you before growing the pool.
 
-> The CLI's own messages are currently in Traditional Chinese. Exit codes and `status --json` are language-neutral.
-
 ## Install
 
 ### Claude Code plugin
@@ -124,16 +122,16 @@ New worktrees, and worktrees whose last preparation failed, run every step. Othe
 
 ## States
 
-`status` shows a Chinese label; `status --json` gives the `state` key.
+`status` shows the label; `status --json` also gives the language-neutral `state` key.
 
 | `state` | Label | Meaning | Does `take` use it? |
 | --- | --- | --- | --- |
-| `idle` | 閒置 | On the base branch (detached), no changes | Yes |
-| `done` | 可回收 | Its branch has been merged into the base, no changes | Yes (the branch is kept) |
-| `busy` | 使用中 | Taken, or has uncommitted changes | No |
-| `stale` | 可能沒在用 | Taken longer than `staleAfterHours` with no commits | No; `sweep --stale` puts it back |
-| `warming` | 準備中 | Installing dependencies | No |
-| `missing` | 不見了 | Its directory was deleted | No; clean it up with `git worktree prune` |
+| `idle` | idle | On the base branch (detached), no changes | Yes |
+| `done` | reclaimable | Its branch has been merged into the base, no changes | Yes (the branch is kept) |
+| `busy` | in use | Taken, or has uncommitted changes | No |
+| `stale` | maybe unused | Taken longer than `staleAfterHours` with no commits | No; `sweep --stale` puts it back |
+| `warming` | preparing | Installing dependencies | No |
+| `missing` | missing | Its directory was deleted | No; clean it up with `git worktree prune` |
 
 A take is recorded in the worktree's git admin directory (`.git/worktrees/<id>/wtpool.json`) and the worktree is
 locked with `git worktree lock`, so `git worktree remove` / `prune` won't delete it by accident. Picking a worktree
@@ -157,6 +155,24 @@ happens under a mutex, so several sessions running `take` at once never get the 
 Common flags: `--no-fetch` skips the fetch, `--quiet` hides progress output.
 
 Exit codes: `0` success, `1` error, `2` no idle worktree.
+
+## Language
+
+The CLI speaks English and Traditional Chinese. Set `WTPOOL_LANG` to choose:
+
+```
+WTPOOL_LANG=en wtpool status       # English
+WTPOOL_LANG=zh-TW wtpool status    # 繁體中文 (zh and zh_TW work too)
+```
+
+Without it, wtpool follows the system language: the display language on Windows (Git Bash always sets `LANG` to
+`en_US`, so it isn't used there), and `LC_ALL` / `LC_MESSAGES` / `LANG` elsewhere. Anything other than Chinese means English.
+
+To pick the language for the Claude Code hooks as well, set it in the `env` block of your Claude Code settings:
+
+```json
+{ "env": { "WTPOOL_LANG": "en" } }
+```
 
 ## Claude Code integration
 

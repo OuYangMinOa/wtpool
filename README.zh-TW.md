@@ -118,6 +118,8 @@ wtpool sweep                   # 分支已經合併的全部放回
 
 ## 狀態
 
+`status --json` 另外有不分語言的 `state` 欄位（依下表順序是 `idle`、`done`、`busy`、`stale`、`warming`、`missing`）。
+
 | 狀態 | 意思 | `take` 會拿嗎 |
 | --- | --- | --- |
 | 閒置 | 停在基準分支（detached），沒有變更 | 會 |
@@ -149,6 +151,24 @@ wtpool sweep                   # 分支已經合併的全部放回
 共用參數：`--no-fetch` 不先 fetch、`--quiet` 不印過程。
 
 結束碼：`0` 成功、`1` 錯誤、`2` 沒有閒著的 worktree。
+
+## 語言
+
+CLI 有英文和繁體中文，用 `WTPOOL_LANG` 切換：
+
+```
+WTPOOL_LANG=en wtpool status       # English
+WTPOOL_LANG=zh-TW wtpool status    # 繁體中文（寫 zh、zh_TW 也可以）
+```
+
+沒設的話跟系統語言：Windows 看系統的顯示語言（Git Bash 一律把 `LANG` 設成 `en_US`，所以不看它），
+其他系統看 `LC_ALL` / `LC_MESSAGES` / `LANG`。不是中文就用英文。
+
+想讓 Claude Code 的 hook 也用指定的語言，在 Claude Code 設定的 `env` 加上：
+
+```json
+{ "env": { "WTPOOL_LANG": "zh-TW" } }
+```
 
 ## 跟 Claude Code 的整合
 

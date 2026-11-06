@@ -3,12 +3,12 @@
   "owner": {
     "name": "OuYangMinOa"
   },
-  "description": "wtpool：預熱好的 git worktree 池",
+  "description": "wtpool: a pool of warm git worktrees",
   "plugins": [
     {
       "name": "wtpool",
       "source": "./",
-      "description": "預熱好的 git worktree 池：開分支時直接拿現成的 worktree，node_modules 和編譯產物都留著"
+      "description": "A pool of warm git worktrees: branch off in a worktree that already has node_modules and build output, no reinstall or rebuild"
     }
   ]
 }
